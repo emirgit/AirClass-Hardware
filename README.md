@@ -20,8 +20,6 @@ This repository contains the **Hardware** part of the system, responsible for ca
 | 200104004107    | Veysel Cemaloğlu        | Hardware Developer | [GitHub](#) | [LinkedIn](#) |
 | 210104004074    | Umut Hüseyin Satır      | Hardware Developer | [GitHub](#) | [LinkedIn](#) |
 
-> ℹ️ You can update the `#` links with each member’s actual GitHub and LinkedIn profiles.
-
 ---
 
 ## 🛠️ Tech Stack
