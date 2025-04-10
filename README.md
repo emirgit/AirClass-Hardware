@@ -16,7 +16,7 @@ This repository contains the **Hardware** part of the system, responsible for ca
 | 200104004015    | Ahmet Sadri Güler       | Hardware Developer | [GitHub](#) | [LinkedIn](#) |
 | 220104004921    | Ahmet Can Hatipoğlu     | Hardware Developer | [GitHub](#) | [LinkedIn](#) |
 | 220104004923    | Selin Bardakcı          | Hardware Developer | [GitHub](#) | [LinkedIn](#) |
-| 200104004068    | Kenan Eren Ayyılmaz     | Hardware Developer | [GitHub](#) | [LinkedIn](#) |
+| 200104004068    | Kenan Eren Ayyılmaz     | Hardware Developer | [GitHub](https://github.com/Erenayyilmaz) | [LinkedIn](https://www.linkedin.com/in/kenanerenayyilmaz/) |
 | 200104004107    | Veysel Cemaloğlu        | Hardware Developer | [GitHub](#) | [LinkedIn](#) |
 | 210104004074    | Umut Hüseyin Satır      | Hardware Developer | [GitHub](#) | [LinkedIn](#) |
 
