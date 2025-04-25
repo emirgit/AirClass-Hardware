@@ -32,6 +32,50 @@ This repository contains the **Hardware** part of the system, responsible for ca
 
 ---
 
+## 📄 Execution
+
+> **Prerequisites**
+>
+> * MediaPipe cloned in `~/mediapipe`
+> * Bazel ≥ 5  
+> * OpenCV dev files (Ubuntu/Debian `sudo apt install libopencv-dev`)
+> * A webcam passed through to the VM as **/dev/video0**  
+
+
+### 1 . Drop the sources
+
+```bash
+# from *inside* the mediapipe repo
+cd ~/mediapipe/mediapipe/examples/desktop
+
+# copy or clone your project folder here
+# result: mediapipe/examples/desktop/airclass_hand_detection
+
+```
+### 2. Build
+```bash
+cd ~/mediapipe          # repo root (same level as WORKSPACE)
+
+# CPU-only build, disable GPU (not available in most VMs)
+bazel build -c opt \
+  --define MEDIAPIPE_DISABLE_GPU=1 \
+  mediapipe/examples/desktop/airclass_hand_detection:airclass_hand_detection
+
+```
+
+### 2. Run
+```bash
+cd ~/mediapipe          # stay at repo root
+
+# send MediaPipe logs to the terminal
+GLOG_logtostderr=1 \
+bazel-bin/mediapipe/examples/desktop/airclass_hand_detection/airclass_hand_detection
+
+```
+
+
+---
+
 ## 📄 License
 
 This project is licensed under the [MIT License](LICENSE).
