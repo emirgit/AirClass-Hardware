@@ -57,9 +57,8 @@ cd ~/mediapipe/mediapipe/examples/desktop
 cd ~/mediapipe          # repo root (same level as WORKSPACE)
 
 # CPU-only build, disable GPU (not available in most VMs)
-bazel build -c opt \
-  --define MEDIAPIPE_DISABLE_GPU=1 \
-  mediapipe/examples/desktop/airclass_hand_detection:airclass_hand_detection
+# Add additional flag if it is needed.
+bazel build -c opt --define xnn_enable_avxvnniint8=false --define MEDIAPIPE_DISABLE_GPU=1 mediapipe/examples/desktop/airclass_hand_detection:airclass_hand_detection
 
 ```
 
