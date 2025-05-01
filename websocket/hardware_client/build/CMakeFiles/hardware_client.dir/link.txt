@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/hardware_client.dir/hardware_client.cpp.o -o hardware_client  /usr/lib/x86_64-linux-gnu/libboost_system.so.1.74.0 /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.74.0 -lpthread /usr/lib/x86_64-linux-gnu/libboost_atomic.so.1.74.0 

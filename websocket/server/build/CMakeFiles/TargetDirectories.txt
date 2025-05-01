@@ -1,0 +1,3 @@
+/mnt/c/Users/cemal/Desktop/classroom/server/build/CMakeFiles/server.dir
+/mnt/c/Users/cemal/Desktop/classroom/server/build/CMakeFiles/edit_cache.dir
+/mnt/c/Users/cemal/Desktop/classroom/server/build/CMakeFiles/rebuild_cache.dir

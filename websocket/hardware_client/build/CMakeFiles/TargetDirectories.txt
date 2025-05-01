@@ -1,0 +1,3 @@
+/mnt/c/Users/cemal/Desktop/classroom/hardware_client/build/CMakeFiles/hardware_client.dir
+/mnt/c/Users/cemal/Desktop/classroom/hardware_client/build/CMakeFiles/edit_cache.dir
+/mnt/c/Users/cemal/Desktop/classroom/hardware_client/build/CMakeFiles/rebuild_cache.dir
