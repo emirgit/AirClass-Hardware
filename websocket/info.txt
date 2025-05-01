@@ -1,0 +1,254 @@
+# AirClass WebSocket Communication System
+
+This README provides comprehensive instructions for setting up, compiling, and running the AirClass WebSocket communication system, consisting of a WebSocket server and client implementations for hardware gesture control and desktop applications.
+
+## System Overview
+
+The AirClass system consists of three main components:
+
+1. **WebSocket Server**: Central communication hub that routes messages between clients
+2. **Hardware Client**: Runs on a Raspberry Pi to send gesture commands detected by a camera
+3. **Desktop Client**: Receives gesture commands to control presentation slides
+
+## Dependencies
+
+Before compilation, you need to install the following dependencies:
+
+### Required Libraries
+
+1. **Boost Libraries**:
+   - Provides ASIO for networking capabilities
+   - Used by WebSocket++ for its network I/O
+
+2. **WebSocket++**:
+   - Header-only C++ WebSocket implementation
+   - Used for WebSocket communication in both server and clients
+
+3. **nlohmann/json**:
+   - Header-only C++ JSON library
+   - Used for message serialization/deserialization
+
+### Installation Instructions
+
+#### Ubuntu/Debian:
+
+```bash
+# Update package list
+sudo apt-get update
+
+# Install Boost libraries and other dependencies
+sudo apt-get install libboost-all-dev cmake g++ git
+sudo apt-get install libssl-dev
+
+# Install nlohmann/json
+sudo apt-get install nlohmann-json3-dev
+
+# Install WebSocket++ (if not available via package manager)
+git clone https://github.com/zaphoyd/websocketpp.git
+cd websocketpp
+mkdir build
+cd build
+cmake ..
+sudo make install
+```
+
+## Compilation Instructions
+
+### Directory Structure
+
+Create a project directory with the following structure:
+
+```
+airclass/
+├── server/
+│   └── websocket_server.cpp
+├── hardware_client/
+│   └── hardware_client.cpp
+└── desktop_client/
+    └── desktop_client.cpp
+```
+
+### Compiling the WebSocket Server
+
+```bash
+cd server
+mkdir build
+cd build
+cmake ..
+make
+```
+
+### Compiling the Hardware Client
+
+```bash
+cd ../../hardware_client
+mkdir build
+cd build
+cmake ..
+make
+```
+
+### Compiling the Desktop Client
+
+```bash
+cd desktop_client
+g++ -o desktop_test_client desktop_test_client.cpp -lboost_system -lpthread -I/usr/include/boost -std=c++11
+```
+
+## Running the System
+
+### Running the WebSocket Server
+
+The server should be run first, as it's the central hub that all clients connect to.
+
+```bash
+cd server/build
+./server [port]
+```
+
+Where `[port]` is the optional port number (default is 8080).
+
+### Running the Hardware Client
+
+The hardware client should be run on the system with the camera (e.g., Raspberry Pi):
+
+```bash
+cd hardware_client/build
+./hardware_client [server_uri] [client_id]
+```
+
+Where:
+- `[server_uri]` is the WebSocket URI of the server (e.g., ws://192.168.1.100:8080)
+- `[client_id]` is an optional identifier for the client (default is "raspberry-pi-gesture")
+
+### Running the Desktop Client
+
+The desktop client should be run on the system displaying the presentation:
+
+```bash
+cd desktop_client
+./desktop_test_client
+```
+
+By default, the desktop client connects to "ws://localhost:8080". If the server is running on a different machine, you'll need to modify the URI in the desktop_client.cpp code.
+
+## Testing in Different Network Environments
+
+### Local Testing (All on One Machine)
+
+For testing all components on one machine:
+
+1. Start the server:
+   ```bash
+   ./server 8080
+   ```
+
+2. Start the desktop client:
+   ```bash
+   ./desktop_test_client
+   ```
+
+3. Start the hardware client:
+   ```bash
+   ./hardware_client ws://localhost:8080 test-hardware
+   ```
+
+### Testing with Virtual Machines
+
+If using VirtualBox or another virtualization solution:
+
+1. Set up bridged networking in VM settings
+2. Find the host machine's IP address:
+   ```bash
+   # On Linux/Mac
+   ifconfig
+   # On Windows
+   ipconfig
+   ```
+
+3. Run the server on the host machine:
+   ```bash
+   ./server 8080
+   ```
+
+4. Run the client in the VM, connecting to the host IP:
+   ```bash
+   ./hardware_client ws://HOST_IP_ADDRESS:8080 vm-client
+   ```
+
+### Testing with Physical Raspberry Pi
+
+1. Ensure the Raspberry Pi and server machine are on the same network
+2. Find the server machine's IP address
+3. Run the server on your main machine:
+   ```bash
+   ./server 8080
+   ```
+
+4. On the Raspberry Pi, run:
+   ```bash
+   ./hardware_client ws://SERVER_IP_ADDRESS:8080 raspberry-pi
+   ```
+
+## Troubleshooting
+
+### Connection Issues
+
+1. **Client Cannot Connect to Server**:
+   - Check that the server is running
+   - Verify the IP address and port are correct
+   - Ensure there are no firewall rules blocking the connection
+   - Try using `ping SERVER_IP` to verify network connectivity
+
+2. **Compilation Errors**:
+   - Ensure all dependencies are installed correctly
+   - Check that the compiler supports C++11
+   - Verify include paths for libraries
+
+3. **Runtime Errors**:
+   - Check for compatibility issues between WebSocket++ and Boost versions
+   - Look for file permission issues with executables (use `chmod +x`)
+
+## System Features
+
+### Server Features
+
+- Manages multiple client connections
+- Routes messages between clients based on type
+- Handles client registration and identification
+- Provides error handling and reporting
+
+### Hardware Client Features
+
+- Connects to the WebSocket server
+- Registers as a hardware client
+- Sends simulated gesture commands
+- Implements automatic reconnection on connection loss
+
+### Desktop Client Features
+
+- Connects to the WebSocket server
+- Registers as a desktop client
+- Receives and displays gesture commands
+- Provides a simple user interface for monitoring
+
+## Extending the System
+
+### Adding New Gesture Commands
+
+To add new gesture types, modify the `CommandType` enum in the hardware client and add the corresponding string conversion in `commandTypeToString()`.
+
+### Implementing Actual Gesture Detection
+
+Replace the simulation code in `processingLoop()` with actual camera input processing using OpenCV and MediaPipe for hand tracking.
+
+### Adding Authentication
+
+Implement token-based authentication by modifying the client registration process and adding verification on the server side.
+
+## Acknowledgments
+
+This system uses the following open-source libraries:
+- [WebSocket++](https://github.com/zaphoyd/websocketpp)
+- [Boost ASIO](https://www.boost.org/)
+- [nlohmann/json](https://github.com/nlohmann/json)
