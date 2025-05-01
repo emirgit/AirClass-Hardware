@@ -5,6 +5,11 @@
 // and a 3-second cooldown after any gesture-driven action.
 // Packet timestamps for MediaPipe are now based on a monotonic clock.
 
+// TODO:
+// 1. Decide the distinct hand gesture
+// 2. Make the code more modular such as dividing it into the files or methods
+// 3. Apply the OOP principle and integrate the communication system to allow communication with server
+
 #include "mediapipe/framework/calculator_graph.h"
 #include "mediapipe/framework/formats/image_frame.h"
 #include "mediapipe/framework/formats/landmark.pb.h"
