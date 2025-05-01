@@ -1,7 +1,9 @@
 // AirClass – gesture-driven command recogniser.
 // Two-hand thumbs-up toggles ACTIVE / PASSIVE.
 // While ACTIVE, single-hand gestures emit four textual commands.
-// NOW includes video display.
+// This version includes video display, an attempt to set the resolution, an FPS counter,
+// and a 3-second cooldown after any gesture-driven action.
+// Packet timestamps for MediaPipe are now based on a monotonic clock.
 
 #include "mediapipe/framework/calculator_graph.h"
 #include "mediapipe/framework/formats/image_frame.h"
@@ -9,48 +11,61 @@
 #include "mediapipe/framework/port/file_helpers.h"
 #include "mediapipe/framework/port/logging.h"
 #include "mediapipe/framework/port/status.h"
+
 #include "mediapipe/framework/formats/image_format.pb.h"
 #include "mediapipe/framework/formats/image_frame_opencv.h"
-#include "mediapipe/framework/port/opencv_imgproc_inc.h"  
-#include "mediapipe/framework/port/opencv_highgui_inc.h"  
+#include "mediapipe/framework/port/opencv_imgproc_inc.h"
+#include "mediapipe/framework/port/opencv_highgui_inc.h"
 
 #include <google/protobuf/text_format.h>
 #include <opencv2/core.hpp>
 #include <opencv2/videoio.hpp>
 
+#include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <memory>
-#include <vector>
+#include <sstream>
 #include <string>
+#include <vector>
 
 namespace mp = mediapipe;
 
 /* ---------- helpers ---------- */
 
-enum class Gesture { kUnknown, kThumbsUp, kThumbsDown,
-                     kOpenPalm, kClosedPalm };
+// The Gesture enum represents the basic hand poses we recognise.
+enum class Gesture { kUnknown, kThumbsUp, kThumbsDown, kOpenPalm, kClosedPalm };
 
+// A fingertip is considered extended when its y-coordinate is above the PIP joint.
 inline bool finger_extended(const mp::NormalizedLandmark& tip,
                             const mp::NormalizedLandmark& pip) {
   return tip.y() < pip.y();
 }
 
+// The classify function interprets a list of 21 hand landmarks into one of the Gesture values.
 Gesture classify(const mp::NormalizedLandmarkList& lm) {
-  if (lm.landmark_size() < 21) return Gesture::kUnknown;
-  const auto& w  = lm.landmark(0);   // wrist
-  const auto& t4 = lm.landmark(4);   // thumb-tip
-  const auto& t3 = lm.landmark(3);   // thumb-ip
-  int ext =
-      finger_extended(lm.landmark( 8), lm.landmark( 6)) +
+  if (lm.landmark_size() < 21) {
+    // If there aren’t enough landmarks, the gesture cannot be determined.
+    return Gesture::kUnknown;
+  }
+  const auto& wrist = lm.landmark(0);
+  const auto& thumb_tip = lm.landmark(4);
+  const auto& thumb_ip  = lm.landmark(3);
+
+  // Count how many of the four fingers (index through pinky) are extended.
+  int extended_count =
+      finger_extended(lm.landmark(8),  lm.landmark(6))  +
       finger_extended(lm.landmark(12), lm.landmark(10)) +
       finger_extended(lm.landmark(16), lm.landmark(14)) +
       finger_extended(lm.landmark(20), lm.landmark(18));
-  bool thumb_up   = finger_extended(t4, t3) && (t4.y() < w.y());
-  bool thumb_down = !finger_extended(t4, t3) && (t4.y() > w.y());
-  if (thumb_up   && ext == 0) return Gesture::kThumbsUp;
-  if (thumb_down && ext == 0) return Gesture::kThumbsDown;
-  if (ext >= 4)               return Gesture::kOpenPalm;
-  if (ext == 0)               return Gesture::kClosedPalm;
+
+  bool thumb_up   = finger_extended(thumb_tip, thumb_ip) && (thumb_tip.y() < wrist.y());
+  bool thumb_down = !finger_extended(thumb_tip, thumb_ip) && (thumb_tip.y() > wrist.y());
+
+  if (thumb_up   && extended_count == 0) return Gesture::kThumbsUp;
+  if (thumb_down && extended_count == 0) return Gesture::kThumbsDown;
+  if (extended_count >= 4)               return Gesture::kOpenPalm;
+  if (extended_count == 0)               return Gesture::kClosedPalm;
   return Gesture::kUnknown;
 }
 
@@ -60,188 +75,242 @@ int main(int argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
   FLAGS_logtostderr = 1;
 
-  /* 1. Load graph config */
+  // The graph configuration text is read from its PBtxt file on disk.
   const std::string graph_path =
       "mediapipe/graphs/hand_tracking/hand_tracking_desktop_live.pbtxt";
   std::string graph_txt;
-  absl::Status st = mp::file::GetContents(graph_path, &graph_txt);
-  if (!st.ok()) {
-    LOG(ERROR) << "Failed to load graph config from " << graph_path << ": " << st;
+  auto status = mp::file::GetContents(graph_path, &graph_txt);
+  if (!status.ok()) {
+    LOG(ERROR) << "Failed to load graph config from " << graph_path << ": " << status;
     return EXIT_FAILURE;
   }
-  LOG(INFO) << "Graph config loaded successfully from: " << graph_path;
+  LOG(INFO) << "Graph configuration loaded.";
 
   mp::CalculatorGraphConfig cfg;
   if (!google::protobuf::TextFormat::ParseFromString(graph_txt, &cfg)) {
-    LOG(ERROR) << "Failed to parse graph config.";
+    LOG(ERROR) << "Failed to parse graph configuration.";
     return EXIT_FAILURE;
   }
 
   mp::CalculatorGraph graph;
-  st = graph.Initialize(cfg);
-  if (!st.ok()) {
-    LOG(ERROR) << "Failed to initialize graph: " << st;
+  status = graph.Initialize(cfg);
+  if (!status.ok()) {
+    LOG(ERROR) << "Failed to initialize graph: " << status;
     return EXIT_FAILURE;
   }
-  LOG(INFO) << "Graph initialized successfully.";
+  LOG(INFO) << "MediaPipe graph initialized.";
 
-  /* 2. Camera */
+  // The camera is opened, and the driver’s internal buffer is limited to one frame.
   LOG(INFO) << "Opening camera device 0...";
   cv::VideoCapture cam(0);
   if (!cam.isOpened()) {
-    LOG(ERROR) << "ERROR: Cannot open camera device 0.";
+    LOG(ERROR) << "Cannot open camera device 0.";
     return EXIT_FAILURE;
   }
-  const int cam_width = static_cast<int>(cam.get(cv::CAP_PROP_FRAME_WIDTH));
-  const int cam_height = static_cast<int>(cam.get(cv::CAP_PROP_FRAME_HEIGHT));
-  LOG(INFO) << "Camera opened successfully: " << cam_width << "x" << cam_height;
+  if (!cam.set(cv::CAP_PROP_BUFFERSIZE, 1)) {
+    LOG(WARNING) << "Could not limit camera buffer size; some queuing may occur.";
+  }
+  cam.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+  cam.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
 
-  /* 4. Pollers for output streams (BEFORE StartRun) */
-  // --- Poller for Landmarks ---
-  const std::string landmark_stream_name = "landmarks";
-  LOG(INFO) << "Adding output stream poller for '" << landmark_stream_name << "'...";
-  auto landmark_poller_or = graph.AddOutputStreamPoller(landmark_stream_name);
+  const int cam_width  = static_cast<int>(cam.get(cv::CAP_PROP_FRAME_WIDTH));
+  const int cam_height = static_cast<int>(cam.get(cv::CAP_PROP_FRAME_HEIGHT));
+  LOG(INFO) << "Camera ready at resolution: " << cam_width << "x" << cam_height;
+
+  // Pollers are created to pull landmarks and rendered video from the graph.
+  auto landmark_poller_or = graph.AddOutputStreamPoller("landmarks");
   if (!landmark_poller_or.ok()) {
-    LOG(ERROR) << "Failed to add poller for stream '" << landmark_stream_name
-               << "': " << landmark_poller_or.status();
+    LOG(ERROR) << "Failed to add poller for landmarks: " << landmark_poller_or.status();
+    cam.release();
     return EXIT_FAILURE;
   }
   auto landmark_poller = std::move(landmark_poller_or.value());
-  LOG(INFO) << "Landmark poller created successfully.";
 
-  // --- Poller for Video Output ---
-  const std::string video_stream_name = "output_video";
-  LOG(INFO) << "Adding output stream poller for '" << video_stream_name << "'...";
-  auto video_poller_or = graph.AddOutputStreamPoller(video_stream_name);
+  auto video_poller_or = graph.AddOutputStreamPoller("output_video");
   if (!video_poller_or.ok()) {
-    LOG(ERROR) << "Failed to add poller for stream '" << video_stream_name
-               << "': " << video_poller_or.status();
+    LOG(ERROR) << "Failed to add poller for output_video: " << video_poller_or.status();
+    cam.release();
     return EXIT_FAILURE;
   }
   auto video_poller = std::move(video_poller_or.value());
-  LOG(INFO) << "Video poller created successfully.";
 
-
-  /* 3. Start the graph */
-  LOG(INFO) << "Starting graph run (no side packets)...";
-  st = graph.StartRun({});
-  if (!st.ok()) {
-    LOG(ERROR) << "Failed to start graph run: " << st;
+  // The graph is started, ready to process incoming frames.
+  status = graph.StartRun({});
+  if (!status.ok()) {
+    LOG(ERROR) << "Failed to start graph run: " << status;
+    cam.release();
     return EXIT_FAILURE;
   }
-  LOG(INFO) << "Graph run started successfully.";
+  LOG(INFO) << "Graph run started.";
 
-  /* 5. Main loop */
   bool active = false;
   bool last_both_up = false;
-  int64_t frame_timestamp_us = 0;
-  const int64_t frame_interval_us = 33333; // ~30 FPS
+
   const std::string window_name = "AirClass Output";
+  cv::namedWindow(window_name, /*flags=*/0);
 
-  cv::Mat frame_bgr; // Input frame from camera
-  cv::Mat frame_display; // Frame to display (output from graph)
+  // Variables for FPS computation.
+  auto fps_start_time = std::chrono::steady_clock::now();
+  int frame_count = 0;
+  double display_fps = 0.0;
 
-  LOG(INFO) << "Starting main loop (press ESC to exit)...";
+  // A cooldown timer ensures at least 3 seconds between any two actions.
+  auto last_action_time = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+  const std::chrono::seconds cooldown(3);
 
+  LOG(INFO) << "Entering main loop (press ESC to exit)...";
   while (true) {
-    // --- Get Frame from Camera ---
+    // A fresh camera frame is grabbed here.
+    cv::Mat frame_bgr;
     cam >> frame_bgr;
     if (frame_bgr.empty()) {
-      LOG(WARNING) << "Camera returned empty frame.";
-      if (!cam.isOpened()) { LOG(ERROR) << "Camera disconnected."; break; }
-      cv::waitKey(1); continue;
+      LOG(WARNING) << "Empty frame received from camera.";
+      if (!cam.isOpened()) {
+        LOG(ERROR) << "Camera appears to be disconnected.";
+        break;
+      }
+      cv::waitKey(1);
+      continue;
     }
 
-    // --- Prepare Input Packet ---
+    // The frame is wrapped into a MediaPipe ImageFrame and sent to the graph.
     auto input_frame = std::make_unique<mp::ImageFrame>(
         mp::ImageFormat::SRGB, frame_bgr.cols, frame_bgr.rows,
         mp::ImageFrame::kDefaultAlignmentBoundary);
-    // Create a view into the mp::ImageFrame's data to copy into
-    cv::Mat input_frame_mat = mp::formats::MatView(input_frame.get());
-    // Copy BGR to RGB into the view
-    cv::cvtColor(frame_bgr, input_frame_mat, cv::COLOR_BGR2RGB);
+    cv::Mat input_mat = mp::formats::MatView(input_frame.get());
+    cv::cvtColor(frame_bgr, input_mat, cv::COLOR_BGR2RGB);
 
-    // --- Send Frame to Graph ---
-    st = graph.AddPacketToInputStream(
-           "input_video",
-           mp::Adopt(input_frame.release()).At(mp::Timestamp(frame_timestamp_us)));
-    if (!st.ok()) {
-      LOG(ERROR) << "Failed to add packet to input stream 'input_video': " << st;
+    // Packet timestamps use the monotonic steady_clock to avoid any system-time jumps.
+    auto now_tp = std::chrono::steady_clock::now();
+    int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                         now_tp.time_since_epoch())
+                         .count();
+    mp::Timestamp timestamp(now_us);
+
+    status = graph.AddPacketToInputStream(
+        "input_video", mp::Adopt(input_frame.release()).At(timestamp));
+    if (!status.ok()) {
+      LOG(ERROR) << "Failed to add packet to input stream: " << status;
       break;
     }
-    frame_timestamp_us += frame_interval_us;
 
-    // --- Receive Landmarks ---
-    mp::Packet landmark_packet;
-    std::vector<mp::NormalizedLandmarkList> hands;
-    if (landmark_poller.Next(&landmark_packet)) {
-        hands = landmark_packet.Get<std::vector<mp::NormalizedLandmarkList>>();
-    } // else: No landmarks packet available yet for this timestamp
-
-    // --- Receive Output Video Frame ---
-    mp::Packet video_packet;
-    if (video_poller.Next(&video_packet)) {
-      // Get the ImageFrame
-      const auto& output_frame = video_packet.Get<mp::ImageFrame>();
-
-      // Convert to cv::Mat for display. Use MatView to avoid copying if possible.
-      // The output from HandRendererSubgraph is likely RGB.
-      cv::Mat output_frame_mat = mp::formats::MatView(&output_frame);
-
-      // Convert RGB back to BGR for OpenCV imshow
-      cv::cvtColor(output_frame_mat, frame_display, cv::COLOR_RGB2BGR);
-
-    } // else: No video packet available yet. Keep showing previous frame?
-
-    /* --- Gesture Logic (remains the same) --- */
-    std::vector<Gesture> current_gestures;
-    for (const auto& hand_landmarks : hands) {
-      current_gestures.push_back(classify(hand_landmarks));
-    }
-    bool both_up = current_gestures.size() == 2 &&
-                   current_gestures[0] == Gesture::kThumbsUp &&
-                   current_gestures[1] == Gesture::kThumbsUp;
-    if (both_up && !last_both_up) {
-      active = !active;
-      std::cout << "\n=== SYSTEM " << (active ? "ACTIVATED" : "PASSIVE") << " ===\n";
-    }
-    last_both_up = both_up;
-    if (active && current_gestures.size() == 1 && !both_up) {
-      switch (current_gestures[0]) {
-        case Gesture::kThumbsUp:   std::cout << "Command: ACCEPT\n"; break;
-        case Gesture::kThumbsDown: std::cout << "Command: REJECT\n"; break;
-        case Gesture::kOpenPalm:   std::cout << "Command: RIGHT\n";  break;
-        case Gesture::kClosedPalm: std::cout << "Command: LEFT\n";   break;
-        case Gesture::kUnknown:    break;
+    // The landmark poller is drained so only the most recent set is used.
+    std::vector<Gesture> gestures;
+    if (landmark_poller.QueueSize() > 0) {
+      mp::Packet packet;
+      int n = landmark_poller.QueueSize();
+      for (int i = 0; i < n - 1; ++i) {
+        landmark_poller.Next(&packet);
+      }
+      if (landmark_poller.Next(&packet)) {
+        const auto& hand_lists =
+            packet.Get<std::vector<mp::NormalizedLandmarkList>>();
+        for (const auto& lm : hand_lists) {
+          gestures.push_back(classify(lm));
+        }
       }
     }
 
-    // --- Display Video Frame ---
-    if (!frame_display.empty()) {
-        cv::imshow(window_name, frame_display);
-    } else {
-        // Optionally display the raw camera feed if graph output isn't ready yet
-        // cv::imshow(window_name, frame_bgr);
-        LOG_EVERY_N(INFO, 300) << "Waiting for initial video output from graph..."; // Log occasionally
+    // The video poller is drained so only the newest rendered frame is shown.
+    cv::Mat graph_output_bgr;
+    bool got_video = false;
+    if (video_poller.QueueSize() > 0) {
+      mp::Packet packet;
+      int m = video_poller.QueueSize();
+      for (int i = 0; i < m - 1; ++i) {
+        video_poller.Next(&packet);
+      }
+      if (video_poller.Next(&packet)) {
+        const auto& output_frame = packet.Get<mp::ImageFrame>();
+        cv::Mat output_mat = mp::formats::MatView(&output_frame);
+        cv::cvtColor(output_mat, graph_output_bgr, cv::COLOR_RGB2BGR);
+        got_video = true;
+      }
     }
 
-    // --- Exit Condition ---
-    if (cv::waitKey(5) == 27) { // ESC key
-        LOG(INFO) << "ESC pressed, exiting loop.";
-        break;
+    // Gesture logic runs only if the cooldown has expired.
+    bool in_cooldown = std::chrono::steady_clock::now() < (last_action_time + cooldown);
+    bool current_both_up = (gestures.size() == 2 &&
+                            gestures[0] == Gesture::kThumbsUp &&
+                            gestures[1] == Gesture::kThumbsUp);
+    if (!in_cooldown) {
+      bool did_action = false;
+
+      // A transition into two-thumbs-up toggles the ACTIVE state.
+      if (current_both_up && !last_both_up) {
+        active = !active;
+        std::cout << "\n=== SYSTEM " << (active ? "ACTIVATED" : "PASSIVE") << " ===\n";
+        did_action = true;
+      }
+      // When ACTIVE, a single hand triggers one of four textual commands.
+      else if (active && gestures.size() == 1 && !current_both_up) {
+        switch (gestures[0]) {
+          case Gesture::kThumbsUp:
+            std::cout << "Command: ACCEPT\n";
+            did_action = true;
+            break;
+          case Gesture::kThumbsDown:
+            std::cout << "Command: REJECT\n";
+            did_action = true;
+            break;
+          case Gesture::kOpenPalm:
+            std::cout << "Command: RIGHT\n";
+            did_action = true;
+            break;
+          case Gesture::kClosedPalm:
+            std::cout << "Command: LEFT\n";
+            did_action = true;
+            break;
+          default:
+            break;
+        }
+      }
+      if (did_action) {
+        last_action_time = std::chrono::steady_clock::now();
+      }
     }
-  } // End main while loop
 
-  /* 6. Clean up */
-  LOG(INFO) << "Closing input streams...";
-  st = graph.CloseAllPacketSources();
-  if (!st.ok()) { LOG(ERROR) << "Failed to close input streams: " << st; }
+    // The transition state is updated so we can catch activation toggles next frame.
+    last_both_up = current_both_up;
 
-  LOG(INFO) << "Waiting for graph to complete...";
-  st = graph.WaitUntilDone();
-  if (!st.ok()) { LOG(ERROR) << "Failed while waiting for graph to complete: " << st; }
+    // Choose the freshest frame for display.
+    cv::Mat display_frame = got_video ? graph_output_bgr : frame_bgr;
 
-  cv::destroyWindow(window_name); // Close the OpenCV window
-  LOG(INFO) << "AirClass finished.";
-  return st.ok() ? EXIT_SUCCESS : EXIT_FAILURE;
+    // Update and overlay the FPS counter.
+    frame_count++;
+    auto fps_now = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(fps_now - fps_start_time).count();
+    if (elapsed >= 1.0) {
+      display_fps = frame_count / elapsed;
+      fps_start_time = fps_now;
+      frame_count = 0;
+    }
+    if (!display_frame.empty()) {
+      std::ostringstream ss;
+      ss << std::fixed << std::setprecision(1) << display_fps;
+      cv::putText(display_frame, "FPS: " + ss.str(), {10, 30},
+                  cv::FONT_HERSHEY_SIMPLEX, 0.8, {0, 255, 0}, 2);
+      if (in_cooldown) {
+        cv::putText(display_frame, "COOLDOWN", {10, 60},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 0, 255}, 2);
+      }
+      cv::imshow(window_name, display_frame);
+    }
+
+    // Pressing ESC exits the main loop.
+    if (cv::waitKey(5) == 27) {
+      LOG(INFO) << "ESC pressed, exiting.";
+      break;
+    }
+  }
+
+  // Cleanup of streams and graph shutdown.
+  graph.CloseAllPacketSources().IgnoreError();
+  graph.WaitUntilDone().IgnoreError();
+  cv::destroyWindow(window_name);
+  if (cam.isOpened()) {
+    cam.release();
+  }
+  LOG(INFO) << "AirClass terminated.";
+  return EXIT_SUCCESS;
 }
