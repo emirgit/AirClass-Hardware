@@ -53,8 +53,11 @@ python main.py
 **Building Servers**
 
 mkdir build
+
 cd build
+
 cmake ..
+
 make
 
 
