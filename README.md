@@ -39,15 +39,19 @@ This project is licensed under the [MIT License](LICENSE).
 
 ## Download 
 **Bash command for downloading the libraries**
+
 sudo apt update && sudo apt install -y libboost-system-dev libboost-thread-dev libboost-dev libasio-dev nlohmann-json3-dev libwebsocketpp-dev python3-opencv python3-venv && python3 -m venv venv && source venv/bin/activate && pip install mediapipe
 
 **Activating the virtual python enviorement in diffrent terminal**
+
 source venv/bin/activate
 
 **After this run this command for python code**
+
 python main.py
 
 **Building Servers**
+
 mkdir build
 cd build
 cmake ..
