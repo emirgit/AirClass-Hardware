@@ -71,8 +71,8 @@ class GestureRecognition:
         image = cv.flip(image, 1)  # Mirror display
         debug_image = copy.deepcopy(image)
 
-        # Saving gesture id for drone controlling
         gesture_id = -1
+        hand_landmarks_list = []
 
         # Detection implementation #############################################################
         image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
@@ -132,12 +132,15 @@ class GestureRecognition:
 
                 # Saving gesture
                 gesture_id = hand_sign_id
+
+                # Save landmarks into hand_landmarks_list
+                hand_landmarks_list.append(hand_landmarks)
         else:
             self.point_history.append([0, 0])
 
         debug_image = self.draw_point_history(debug_image, self.point_history)
 
-        return debug_image, gesture_id
+        return debug_image, gesture_id, hand_landmarks_list
 
     def draw_point_history(self, image, point_history):
         for index, point in enumerate(point_history):
@@ -457,13 +460,6 @@ class GestureRecognition:
             info_text = info_text + ':' + hand_sign_text
         cv.putText(image, info_text, (brect[0] + 5, brect[1] - 4),
                    cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
-
-        # if finger_gesture_text != "":
-        #     cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60),
-        #                cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv.LINE_AA)
-        #     cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60),
-        #                cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2,
-        #                cv.LINE_AA)
 
         return image
 
