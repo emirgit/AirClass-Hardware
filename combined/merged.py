@@ -8,6 +8,8 @@ import pickle
 import time
 
 DEBUG = False
+gesture_threshold = 400
+GESTURE_COOLDOWN = 1
 model = load_model('SON.keras')
 
 # MediaPipe el tespit edici
@@ -40,50 +42,54 @@ def extract_hand_features(hand_landmarks):
 
 # Added gesture handling function similar to the one in paste-1.txt
 last_gesture_time = 0
-gesture_cooldown = 1.5
-gesture_threshold = 400  # Configuration will be done at the start
 
 def send_websocket(command):
     with open('websocket.txt', 'a') as f:
         f.write(command + '\n')
 
-def handle_gesture(frame, gesture_text, hand_landmarks, image_height):
-    global last_gesture_time
+def handle_gesture(frame, gesture_text, landmarks):
+    global last_gesture_time, gesture_threshold
     current_time = time.time()
     
     # Only process if we have hand landmarks
-    if hand_landmarks:
-        # Get the Y coordinate of the first landmark (similar to paste-1.txt)
-        gesture_y = hand_landmarks.landmark[1].y * image_height
-        is_above_threshold = gesture_y < gesture_threshold
-        
-        # Add threshold line to the frame
-        cv2.line(frame, (0, gesture_threshold), (frame.shape[1], gesture_threshold), (0, 0, 255), 2)
-        
+    if landmarks:
         # Check cooldown and process gesture
-        if current_time - last_gesture_time >= gesture_cooldown:
-            if gesture_text != "IDLE":
-                if gesture_text == "OpenPalm":
-                    # Process OpenPalm gesture
-                    a = 1  # Placeholder action as in paste-1.txt
-                elif gesture_text == "ClosePalm":
-                    # Process ClosePalm gesture 
-                    a = 1  # Placeholder action
-                elif gesture_text == "Up":
-                    send_websocket(gesture_text)
-                elif gesture_text == "Down":
-                    # Process Down gesture
-                    a = 1  # Placeholder action
-                elif gesture_text == "Fist":
-                    # Process Fist gesture
-                    a = 1  # Placeholder action
-                elif (gesture_text == "Left") and (is_above_threshold):
-                    send_websocket(gesture_text)
-                elif (gesture_text == "Right") and (is_above_threshold):
-                    send_websocket(gesture_text)
-                
-                # Update last gesture time
-                last_gesture_time = current_time
+        if current_time - last_gesture_time >= GESTURE_COOLDOWN:
+            # Her gesture için ayrı işlem bloğu
+            if gesture_text == "call":
+                # call için özel işlem
+                send_websocket("call")
+            elif gesture_text == "dislike":
+                # dislike için özel işlem
+                send_websocket("dislike")
+            elif gesture_text == "like":
+                send_websocket("like")
+            elif gesture_text == "mute":
+                send_websocket("mute")
+            elif gesture_text == "ok":
+                gesture_threshold = int(landmarks[8].y * frame.shape[0])
+                send_websocket("ok")
+            elif gesture_text == "one":
+                send_websocket("one")
+            elif gesture_text == "stop":
+                send_websocket("stop")
+            elif gesture_text == "two_up":
+                send_websocket("two_up")
+            elif gesture_text == "rock":
+                send_websocket("rock")
+            elif gesture_text == "three":
+                send_websocket("three")
+            elif gesture_text == "two_up_inverse":
+                send_websocket("two_up_inverse")
+            elif gesture_text == "stop_inverse":
+                send_websocket("stop_inverse")
+            elif gesture_text == "three2":
+                send_websocket("three2")
+            elif gesture_text == "timeout":
+                send_websocket("timeout")
+            
+            # Update last gesture time
+            last_gesture_time = current_time
     
     return frame
 
@@ -97,7 +103,7 @@ if not cap.isOpened():
 last_output_time = time.time()
 current_gesture = "IDLE"
 gesture_start_time = None
-stable_duration = 0.5
+stable_duration = 0.4
 gesture_text = "IDLE"
 
 # Scaler'ı yükle
@@ -134,12 +140,13 @@ while True:
     # Eğer el tespit edildiyse
     if results.multi_hand_landmarks:
         for hand_landmarks in results.multi_hand_landmarks:
-            current_hand_landmarks = hand_landmarks
             # Eli görüntü üzerinde çiz
             mp_drawing.draw_landmarks(
                 frame, 
                 hand_landmarks, 
                 mp_hands.HAND_CONNECTIONS)
+            
+            current_hand_landmarks = hand_landmarks.landmark
             
             # El özelliklerini çıkar
             features_df = extract_hand_features(hand_landmarks)
@@ -192,13 +199,15 @@ while True:
         current_gesture = "IDLE"
     
     # Handle gesture processing
-    frame = handle_gesture(frame, gesture_text, current_hand_landmarks, frame.shape[0])
+    frame = handle_gesture(frame, gesture_text, current_hand_landmarks)
                 
     # Ekranın sol üstüne hareket adini yazar
     cv2.putText(
         frame, gesture_text, (30, 50), 
         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA
     )
+    
+    cv2.line(frame, (0, gesture_threshold), (frame.shape[1], gesture_threshold), (0, 0, 255), 2)
 
     # Görüntüyü göster
     cv2.imshow('Hand Gesture Recognition', frame)
