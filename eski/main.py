@@ -8,6 +8,9 @@ from collections import Counter
 
 last_gesture_time = 0
 gesture_cooldown = 1.5
+ok_counter = 0
+config_start_time = None
+gesture_y_values = []
 
 gesture_threshold = 400 # configuration will be done at the start
 
@@ -35,59 +38,48 @@ def get_args():
 
     return args
 
-
 def send_websocket(command):
     with open('websocket.txt', 'a') as f:
         f.write(command + '\n')
 
-def handle_gesture(debug_image, gesture_id, gesture_labels, wrist_y):
+def config_threshold(gesture_name, gesture_y):
+    global config_start_time, gesture_threshold
+
+def handle_gesture(debug_image, hand_gesture_name, hand_lanmarks_list, image_hight):
     global last_gesture_time
     current_time = time.time()
 
-    is_above_threshold = 0
-
-    if wrist_y is not None:
-        is_above_threshold = wrist_y < gesture_threshold
-
-    if gesture_id is not None and 0 <= gesture_id < len(gesture_labels):
-        hand_gesture_name = gesture_labels[gesture_id]
-    else:
-        hand_gesture_name = "IDLE"
+    gesture_y = hand_lanmarks_list.landmarks[1].y * image_hight
+    is_above_threshold = gesture_y < gesture_threshold
 
     if current_time - last_gesture_time >= gesture_cooldown:
-        if (hand_gesture_name != "IDLE") & (is_above_threshold == 1):
-            if hand_gesture_name == "Forward":
+        if (hand_gesture_name != "IDLE"):
+            if hand_gesture_name == "OpenPalm":
                 # print("Detected Forward - Performing Action A")
                 # send_websocket("Action A")
                 a = 1
-            elif hand_gesture_name == "Config":
+            elif hand_gesture_name == "ClosePalm":
                 # print("Detected Config - Performing Action B")
                 # send_websocket("Action B")
                 a = 1
             elif hand_gesture_name == "Up":
-                # print("Detected Up - Performing Action C")
-                # send_websocket("Action C")
-                a = 1
-            elif hand_gesture_name == "OK":
-                # print("Detected OK - Performing Action D")
-                # send_websocket("Action D")
-                a = 1
+                send_websocket(hand_gesture_name)
             elif hand_gesture_name == "Down":
                 # print("Detected Down - Performing Action E")
                 # send_websocket("Action E")
                 a = 1
-            elif hand_gesture_name == "Stop":
+            elif hand_gesture_name == "Fist":
                 # print("Detected Stop - Performing Action F")
                 # send_websocket("Action F")
                 a = 1
-            elif hand_gesture_name == "Left":
+            elif (hand_gesture_name == "Left") & (is_above_threshold == True):
                 send_websocket(hand_gesture_name)
-            elif hand_gesture_name == "Right":
+            elif (hand_gesture_name == "Right") & (is_above_threshold == True):
                 send_websocket(hand_gesture_name)
             
             last_gesture_time = current_time
 
-    return debug_image, hand_gesture_name
+    return debug_image
 
 def main():
     global gesture_buffer
@@ -101,7 +93,7 @@ def main():
     args = get_args()
     WRITE_CONTROL = False
 
-    gesture_labels = ["Forward", "Config", "Up", "OK", "Down", "Stop", "Left", "Right"]
+    gesture_labels = ["OpenPalm", "ClosePalm", "Up", "OK", "Down", "Fist", "Left", "Right"]
 
     cap = cv.VideoCapture(1)
 
@@ -132,22 +124,17 @@ def main():
         debug_image, gesture_id, hand_landmarks_list = gesture_detector.recognize(image, number, mode)
         gesture_buffer.add_gesture(gesture_id)
 
-        # Red line for testing purposes
+        # Red threshold line for testing purposes
         cv.line(debug_image, (0, gesture_threshold), (args.width*2, gesture_threshold), (0, 0, 255), 2)
 
-        wrist_y = None
-        if hand_landmarks_list is not None and len(hand_landmarks_list) > 0:
-            image_width, image_height = debug_image.shape[1], debug_image.shape[0]
-            wrist_positions = []
+        # Get gesture_name
+        if gesture_id is not None and 0 <= gesture_id < len(gesture_labels):
+            hand_gesture_name = gesture_labels[gesture_id]
+        else:
+            hand_gesture_name = "IDLE"
 
-            for hand_landmarks in hand_landmarks_list[:2]:
-                wrist_y_pos = int(hand_landmarks.landmark[1].y * image_height)
-                wrist_positions.append(wrist_y_pos)
-
-            wrist_y = min(wrist_positions)
-
-        # handle image
-        debug_image, gesture_name = handle_gesture(debug_image, gesture_id, gesture_labels, wrist_y)
+        # Handle gesture
+        debug_image = handle_gesture(debug_image, hand_gesture_name, hand_landmarks_list, debug_image.shape[0])
 
         debug_image = gesture_detector.draw_info(debug_image, fps, mode, number)
         cv.imshow('Hand Gesture Recognition', debug_image)

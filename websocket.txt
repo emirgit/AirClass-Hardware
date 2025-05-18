@@ -1,6 +1,0 @@
-# Gesture Commands Log
-Left
-Left
-Left
-Right
-Right
