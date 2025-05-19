@@ -11,7 +11,7 @@ This repository contains the **Hardware** part of the system, responsible for ca
 | Student Number  | Name                    | Role               | GitHub | LinkedIn |
 |-----------------|-------------------------|--------------------|--------|----------|
 | 210104004071    | Muhammed Emir Kara      | Hardware Developer | [GitHub](https://github.com/emirgit) | [LinkedIn](https://www.linkedin.com/in/muhammed-emir-kara-787605251/) |
-| 240104004980    | Helin Saygılı           | Hardware Developer | [GitHub](#) | [LinkedIn](#) |
+| 240104004980    | Helin Saygılı           | Hardware Developer | [GitHub](https://github.com/ahmetcnh) | [LinkedIn](https://www.linkedin.com/in/ahmet-can-hatipoğlu-46a03925a/) |
 | 210104004092    | Ahmet Mücahit Gündüz    | Hardware Developer | [GitHub](https://github.com/agunduz42) | [LinkedIn](https://www.linkedin.com/in/agunduz42/) |
 | 200104004015    | Ahmet Sadri Güler       | Hardware Developer | [GitHub](#) | [LinkedIn](#) |
 | 220104004921    | Ahmet Can Hatipoğlu     | Hardware Developer | [GitHub](#) | [LinkedIn](#) |
