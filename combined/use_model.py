@@ -55,6 +55,7 @@ def handle_gesture(frame, gesture_text, landmarks):
     if landmarks:
         # Check cooldown and process gesture
         if current_time - last_gesture_time >= GESTURE_COOLDOWN:
+            frame_height = frame.shape[0]
             # Her gesture için ayrı işlem bloğu
             if gesture_text == "call":
                 # call için özel işlem
@@ -67,7 +68,7 @@ def handle_gesture(frame, gesture_text, landmarks):
             elif gesture_text == "mute":
                 send_websocket("mute")
             elif gesture_text == "ok":
-                gesture_threshold = int(landmarks[8].y * frame.shape[0])
+                gesture_threshold = int(landmarks[8].y * frame_height)
                 send_websocket("ok")
             elif gesture_text == "one":
                 send_websocket("one")
