@@ -2,6 +2,12 @@
 
 Bu projede el hareketlerinden veri çıkarımı, CSV birleştirme ve makine öğrenmesi modeli eğitimi için üç ana Python dosyası kullanılır. Aşağıda her bir dosyanın **adım adım nasıl kullanılacağı**, hangi dosya/dizin adlarının girileceği ve kullanıcıya sunulan seçenekler detaylı şekilde açıklanmıştır.
 
+> **Başlamadan önce:**  
+Öncelikle terminalde bu klasöre geçin ve ardından gerekli Python kütüphanelerini yükleyin:
+```bash
+pip install -r requirements.txt
+```
+
 ---
 
 ## 1. extract_landmarks.py
