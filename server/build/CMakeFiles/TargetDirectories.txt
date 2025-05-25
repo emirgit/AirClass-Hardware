@@ -1,0 +1,3 @@
+/home/veysel/Desktop/airclass/AirClass-Hardware-ahmetcnh/server/build/CMakeFiles/server.dir
+/home/veysel/Desktop/airclass/AirClass-Hardware-ahmetcnh/server/build/CMakeFiles/edit_cache.dir
+/home/veysel/Desktop/airclass/AirClass-Hardware-ahmetcnh/server/build/CMakeFiles/rebuild_cache.dir
