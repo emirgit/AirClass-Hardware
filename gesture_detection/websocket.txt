@@ -1,41 +1,14 @@
-# Gesture Commands Log
-take_picture
-take_picture
-take_picture
-RIGHT
-RIGHT
-RIGHT
-RIGHT
-take_picture
-take_picture
-take_picture
-take_picture
-LEFT
-LEFT
-LEFT
-LEFT
-LEFT
-dislike
-dislike
-take_picture
-take_picture
-take_picture
-take_picture
-take_picture
-take_picture
-take_picture
-take_picture
-take_picture
-RIGHT
-LEFT
-LEFT
-LEFT
-RIGHT
-take_picture
-take_picture
-take_picture
-take_picture
-RIGHT
-LEFT
-LEFT
-LEFT
+{"command": "two_up", "position": {"x": 0.35355761647224426, "y": 0.42965301871299744}}
+{"command": "two_up", "position": {"x": 0.3547672927379608, "y": 0.42864421010017395}}
+{"command": "two_up", "position": {"x": 0.3563779592514038, "y": 0.42964568734169006}}
+{"command": "two_up", "position": {"x": 0.35279783606529236, "y": 0.4313705265522003}}
+{"command": "two_up", "position": {"x": 0.35204023122787476, "y": 0.4294319450855255}}
+{"command": "two_up", "position": {"x": 0.3463539779186249, "y": 0.39733850955963135}}
+{"command": "two_up", "position": {"x": 0.34869384765625, "y": 0.3450024724006653}}
+{"command": "two_up", "position": {"x": 0.3585200905799866, "y": 0.30617502331733704}}
+{"command": "two_up", "position": {"x": 0.3695680499076843, "y": 0.27225327491760254}}
+{"command": "two_up", "position": {"x": 0.3785874545574188, "y": 0.23646549880504608}}
+{"command": "two_up", "position": {"x": 0.3822137415409088, "y": 0.19934481382369995}}
+{"command": "two_up", "position": {"x": 0.38113242387771606, "y": 0.16143681108951569}}
+{"command": "two_up", "position": {"x": 0.38369667530059814, "y": 0.13487285375595093}}
+{"command": "two_up", "position": {"x": 0.37709271907806396, "y": 0.10609719157218933}}

@@ -13,7 +13,7 @@ import stat
 import signal
 import sys
 
-DEBUG = False
+DEBUG = True
 gesture_threshold = 400
 GESTURE_COOLDOWN = 1
 TWO_UP_DISTANCE_THRESHOLD = 0.05  # İki parmak arası mesafe eşiği 
@@ -111,20 +111,17 @@ def calculate_angle(p1, p2, p3):
 # Added gesture handling function similar to the one in paste-1.txt
 last_gesture_time = 0
 
-# Updated send_websocket function to handle pipe opening
+# Updated send_websocket function with DEBUG mode
 def send_websocket(command, position_data=None):
     """
     Send command to the C++ program via the named pipe
-    Formats the data as JSON with standardized fields
+    When DEBUG is True, writes to websocket.txt file instead
     """
     global pipe_fd
     
     # Create a JSON message that matches the expected format in the C++ client
     message = {
-        "type": "gesture",
         "command": command,
-        "source": "hardware",
-        "timestamp": time.time()
     }
     
     # Add position data if provided (for tracking mode)
@@ -134,6 +131,18 @@ def send_websocket(command, position_data=None):
     # Convert to JSON string and add newline for message separation
     json_str = json.dumps(message) + "\n"
     
+    # In DEBUG mode, write to file instead of pipe
+    if DEBUG:
+        try:
+            with open('websocket.txt', 'a') as f:
+                f.write(json_str)
+            print(f"DEBUG: Wrote to websocket.txt: {command}")
+            return
+        except Exception as e:
+            print(f"DEBUG: Error writing to file: {e}")
+            return
+    
+    # Non-DEBUG mode: Use named pipe as before
     try:
         # Open pipe for writing if not already open
         if pipe_fd is None:
@@ -211,7 +220,7 @@ def handle_gesture(frame, gesture_text, landmarks, is_right_hand=True):
             y = int(index_tip.y * frame_height)
             
             # Send position data in normalized format (0-1 range)
-            position_data = {"x": index_tip.x, "y": index_tip.y}
+            position_data = {"x": x, "y": y}
             send_websocket("one", position_data)
             
             # Draw tracking indicator on frame
@@ -310,7 +319,7 @@ setup_pipe()
 send_websocket("init", {"status": "ready"})
 
 # Kamerayı aç
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(1)
 if not cap.isOpened():
     print("Kamera acilamadi! Kamera numarasi hatali")
     cleanup_handler(None, None)
