@@ -1,385 +1,685 @@
-#include <websocketpp/config/asio_no_tls.hpp>
-#include <websocketpp/client.hpp>
-#include <iostream>
-#include <string>
-#include <memory>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <chrono>
+#include <websocketpp/config/asio_no_tls.hpp>      // WebSocket++ config for non-TLS (plain WS)
+#include <websocketpp/client.hpp>                  // WebSocket++ client implementation
+#include <iostream>                                // std::cout, std::cerr
+#include <string>                                  // std::string
+#include <memory>                                  // std::shared_ptr, std::make_shared
+#include <thread>                                  // std::thread, std::this_thread::sleep_for
+#include <mutex>                                   // std::mutex, std::lock_guard, std::unique_lock
+#include <condition_variable>                      // std::condition_variable
+#include <chrono>                                  // std::chrono::seconds, std::chrono::milliseconds
+#include <atomic>                                  // std::atomic<bool>
+#include <cstdlib>                                 // std::getenv
+#include <stdexcept>                               // std::exception
+#include <fstream>                                 // std::ifstream
+#include <sstream>                                 // std::stringstream
+#include <unistd.h>                               // read, close
+#include <fcntl.h>                                // open, O_RDONLY
+#include <sys/stat.h>                             // mkfifo
+
+// JSON library for message parsing and serialization
 #include <nlohmann/json.hpp>
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-
-// For convenience
+// Convenience aliases for JSON and WebSocket++ placeholders
 using json = nlohmann::json;
 using websocketpp::lib::placeholders::_1;
 using websocketpp::lib::placeholders::_2;
+using websocketpp::connection_hdl;
 
-typedef websocketpp::client<websocketpp::config::asio> websocket_client;
-typedef websocketpp::config::asio::message_type::ptr message_ptr;
+// Define the WebSocket++ client type using ASIO transport without TLS
+typedef websocketpp::client<websocketpp::config::asio> client;
+typedef client::message_ptr message_ptr;
 
-// Enum for command types
+// Named pipe path (must match Python script)
+const std::string PIPE_PATH = "/tmp/gesture_pipe";
+
+// Enumeration of gesture/command types sent from the hardware to server
 enum class CommandType {
     NEXT_SLIDE,
     PREVIOUS_SLIDE,
-    ZOOM_IN,
-    ZOOM_OUT,
-    START_PRESENTATION,
-    END_PRESENTATION,
-    GRANT_PERMISSION,
-    DENY_PERMISSION,
-    NO_COMMAND
+    LIKE,
+    DISLIKE,
+    CALL,
+    OK,
+    ROCK,
+    THREE,
+    THREE2,
+    TIMEOUT,
+    PALM_ATTENDANCE,
+    TAKE_PICTURE,
+    HEART,
+    HEART2,
+    MID_FINGER,
+    FOUR,
+    THUMB_INDEX,
+    HOLY,
+    ONE,
+    TWO_UP,
+    TRACK_POS,
+    INIT,
+    UNKNOWN    // Fallback if gesture not recognized
 };
+
+std::string discoverDesktopIP(int port = 9999, const std::string& broadcastMessage = "raspberry_discovery") {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        return "";
+    }
+
+    int broadcastEnable = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable)) < 0) {
+        perror("setsockopt");
+        close(sock);
+        return "";
+    }
+
+    sockaddr_in broadcastAddr{};
+    broadcastAddr.sin_family = AF_INET;
+    broadcastAddr.sin_port = htons(port);
+    broadcastAddr.sin_addr.s_addr = inet_addr("255.255.255.255");
+
+    sockaddr_in fromAddr{};
+    socklen_t fromLen = sizeof(fromAddr);
+    char buffer[128];
+
+    while (true) {
+        // Send discovery message
+        ssize_t sent = sendto(sock, broadcastMessage.c_str(), broadcastMessage.length(), 0,
+                              (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
+        if (sent < 0) {
+            perror("sendto");
+        } else {
+            std::cout << "[UDP] Broadcast gönderildi, cevap bekleniyor...\n";
+        }
+
+        // Set 2-second receive timeout
+        struct timeval tv = {2, 0};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        // Try receiving response
+        ssize_t recvLen = recvfrom(sock, buffer, sizeof(buffer) - 1, 0,
+                                   (sockaddr*)&fromAddr, &fromLen);
+        if (recvLen > 0) {
+            buffer[recvLen] = '\0';
+            std::string desktopIp(buffer);
+
+            // Check if received data looks like a valid IP (basic check)
+            if (!desktopIp.empty() && desktopIp.find('.') != std::string::npos) {
+                std::cout << "[UDP] Masaüstü IP adresi bulundu: " << desktopIp << std::endl;
+                close(sock);
+                return desktopIp;
+            } else {
+                std::cerr << "[UDP] Geçersiz IP cevabı alındı: '" << desktopIp << "'\n";
+            }
+        } else {
+            std::cout << "[UDP] Cevap alınamadı, yeniden deneniyor...\n";
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    close(sock);
+    return "";
+}
+
 
 class WebSocketHardwareClient {
 public:
-    WebSocketHardwareClient(const std::string& uri, const std::string& clientId) 
-        : m_uri(uri), m_clientId(clientId), m_connected(false), m_reconnectAttempts(0), 
-          m_maxReconnectAttempts(5), m_reconnectDelayMs(2000) {
-
+    // Constructor: store URI and clientId, initialize state flags
+    WebSocketHardwareClient(std::string uri, std::string clientId)
+        : m_uri(std::move(uri))
+        , m_clientId(std::move(clientId))
+        , m_connected(false)
+        , m_connecting(false)
+        , m_reconnect_attempts(0)
+        , m_max_reconnect_attempts(5)
+        , m_reconnect_delay_ms(2000)
+        , m_stop_requested(false)
+    {
+        // Reduce logging verbosity
         m_client.clear_access_channels(websocketpp::log::alevel::all);
         m_client.set_access_channels(websocketpp::log::alevel::connect);
         m_client.set_access_channels(websocketpp::log::alevel::disconnect);
         m_client.set_access_channels(websocketpp::log::alevel::app);
 
+        // Initialize ASIO I/O service
         m_client.init_asio();
 
+        // Register event handlers
         m_client.set_open_handler(bind(&WebSocketHardwareClient::on_open, this, _1));
         m_client.set_close_handler(bind(&WebSocketHardwareClient::on_close, this, _1));
         m_client.set_fail_handler(bind(&WebSocketHardwareClient::on_fail, this, _1));
         m_client.set_message_handler(bind(&WebSocketHardwareClient::on_message, this, _1, _2));
     }
 
+    // Destructor: ensure graceful shutdown if still running
     ~WebSocketHardwareClient() {
-        disconnect();
+        if (!m_stop_requested) {
+            stop();
+        }
     }
 
+    // Attempt to establish WebSocket connection (and wait for confirmation)
     bool connect() {
+        if (m_connected || m_connecting) {
+            return true;  // Already in progress or connected
+        }
+        m_connecting = true;
+        m_stop_requested = false;
+
+        std::cout << "Attempting to connect to " << m_uri << "..." << std::endl;
         try {
             websocketpp::lib::error_code ec;
-            auto con = m_client.get_connection(m_uri, ec);
+            // Create connection object
+            client::connection_ptr con = m_client.get_connection(m_uri, ec);
             if (ec) {
-                std::cerr << "Could not create connection: " << ec.message() << std::endl;
+                std::cerr << "Connect initialization error: " << ec.message() << std::endl;
+                m_connecting = false;
                 return false;
             }
-
             m_hdl = con->get_handle();
             m_client.connect(con);
 
-            m_thread = std::thread([this]() { 
-                try {
-                    m_client.run();
-                } catch (const std::exception& e) {
-                    std::cerr << "Exception in WebSocket run loop: " << e.what() << std::endl;
-                }
-            });
-
-            std::unique_lock<std::mutex> lock(m_mutex);
-            if (!m_cv.wait_for(lock, std::chrono::seconds(5), [this]{ return m_connected || m_reconnectAttempts > 0; })) {
-                std::cerr << "Connection timeout" << std::endl;
-                return false;
+            // Launch ASIO run loop on its own thread if not already running
+            if (!m_client_thread.joinable()) {
+                m_client_thread = std::thread([this]() {
+                    try {
+                        m_client.run();
+                    } catch (const std::exception& e) {
+                        std::cerr << "Exception in ASIO run loop: " << e.what() << std::endl;
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        m_connected = false;
+                        m_connecting = false;
+                        m_cond.notify_all();
+                    }
+                });
             }
 
+            // Wait (up to 10s) for on_open to signal connection success/failure
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                if (!m_cond.wait_for(lock, std::chrono::seconds(10),
+                                     [this]{ return m_connected || !m_connecting; })) {
+                    std::cerr << "Connection attempt timed out." << std::endl;
+                    m_connecting = false;
+                    return false;
+                }
+            }
+            m_connecting = false;
             return m_connected;
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Exception during connect: " << e.what() << std::endl;
+
+        } catch (const std::exception& e) {
+            std::cerr << "Exception during connect(): " << e.what() << std::endl;
+            m_connecting = false;
             return false;
         }
     }
 
-    void disconnect() {
+    // Stop the WebSocket client: close connection and join thread
+    void stop() {
+        if (m_stop_requested) return;
+        m_stop_requested = true;
+
+        // If currently connected, send a close frame
         if (m_connected) {
+            websocketpp::lib::error_code ec;
+            std::cout << "Closing WebSocket connection..." << std::endl;
             try {
-                websocketpp::lib::error_code ec;
-                m_client.close(m_hdl, websocketpp::close::status::normal, "Closing connection", ec);
-
-                if (ec) {
-                    std::cerr << "Error closing connection: " << ec.message() << std::endl;
+                if (!m_hdl.expired()) {
+                    m_client.close(m_hdl, websocketpp::close::status::going_away, "Client shutdown", ec);
+                    if (ec) {
+                        std::cerr << "Error closing connection: " << ec.message() << std::endl;
+                    }
                 }
-            }
-            catch (const std::exception& e) {
-                std::cerr << "Exception during disconnect: " << e.what() << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Exception while closing connection: " << e.what() << std::endl;
             }
         }
-
-        m_client.stop();
-        if (m_thread.joinable()) {
-            m_thread.join();
-        }
-
         m_connected = false;
+        m_connecting = false;
+
+        // Stop ASIO event loop
+        try {
+            std::cout << "Stopping WebSocket ASIO service..." << std::endl;
+            m_client.stop();
+        } catch (const std::exception& e) {
+            std::cerr << "Exception during client stop(): " << e.what() << std::endl;
+        }
+
+        // Wait for the ASIO thread to finish
+        if (m_client_thread.joinable()) {
+            std::cout << "Waiting for ASIO thread to join..." << std::endl;
+            m_client_thread.join();
+            std::cout << "WebSocket client ASIO thread joined." << std::endl;
+        }
     }
 
-    bool sendCommand(CommandType command) {
-        if (!m_connected) {
-            std::cerr << "Not connected to server" << std::endl;
-            return false;
+    // Send a gesture command to the server encoded as JSON
+    bool sendCommand(CommandType command_type, const json& position_data = json()) {
+        if (!m_connected) return false;
+
+        std::string command_str = commandTypeToString(command_type);
+        if (command_str == "unknown") return false;
+
+        // Build JSON message
+        json message = {
+            {"type", "gesture"},
+            {"command", command_str},
+            {"source", "hardware"},
+            {"clientId", m_clientId},
+            {"timestamp", std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()}
+        };
+
+        // Add position data if provided (for tracking commands)
+        if (!position_data.empty()) {
+            message["position"] = position_data;
         }
 
+        websocketpp::lib::error_code ec;
         try {
-            std::string commandStr = commandTypeToString(command);
-            json message = {
-                {"type", "gesture_command"},
-                {"source", "hardware"},
-                {"client_id", m_clientId},
-                {"command", commandStr},
-                {"timestamp", std::chrono::system_clock::now().time_since_epoch().count()}
-            };
-
-            websocketpp::lib::error_code ec;
-            m_client.send(m_hdl, message.dump(), websocketpp::frame::opcode::text, ec);
-
-            if (ec) {
-                std::cerr << "Error sending message: " << ec.message() << std::endl;
+            if (!m_hdl.expired()) {
+                m_client.send(m_hdl, message.dump(), websocketpp::frame::opcode::text, ec);
+            } else {
                 return false;
             }
-
-            std::cout << "Sent command: " << commandStr << std::endl;
-            return true;
-        }
-        catch (const std::exception& e) {
+        } catch (const std::exception& e) {
             std::cerr << "Exception during sendCommand: " << e.what() << std::endl;
             return false;
         }
+
+        if (ec) {
+            std::cerr << "Error sending command: " << ec.message() << std::endl;
+            return false;
+        }
+        return true;
     }
 
+    // Check current connection state
     bool isConnected() const {
         return m_connected;
     }
 
+    // Convert string command to CommandType enum
+    CommandType stringToCommandType(const std::string& command) {
+        if (command == "next_slide") return CommandType::NEXT_SLIDE;
+        if (command == "previous_slide") return CommandType::PREVIOUS_SLIDE;
+        if (command == "like") return CommandType::LIKE;
+        if (command == "dislike") return CommandType::DISLIKE;
+        if (command == "call") return CommandType::CALL;
+        if (command == "ok") return CommandType::OK;
+        if (command == "rock") return CommandType::ROCK;
+        if (command == "three") return CommandType::THREE;
+        if (command == "three2") return CommandType::THREE2;
+        if (command == "timeout") return CommandType::TIMEOUT;
+        if (command == "Attendance") return CommandType::PALM_ATTENDANCE;
+        if (command == "take_picture") return CommandType::TAKE_PICTURE;
+        if (command == "heart") return CommandType::HEART;
+        if (command == "heart2") return CommandType::HEART2;
+        if (command == "mid_finger") return CommandType::MID_FINGER;
+        if (command == "four") return CommandType::FOUR;
+        if (command == "thumb_index") return CommandType::THUMB_INDEX;
+        if (command == "holy") return CommandType::HOLY;
+        if (command == "one") return CommandType::ONE;
+        if (command == "two_up") return CommandType::TWO_UP;
+        if (command == "TRACK_POS") return CommandType::TRACK_POS;
+        if (command == "init") return CommandType::INIT;
+        return CommandType::UNKNOWN;
+    }
+
+    // Convert CommandType enum to the corresponding string
+    std::string commandTypeToString(CommandType command) {
+        switch (command) {
+            case CommandType::NEXT_SLIDE:     return "next_slide";
+            case CommandType::PREVIOUS_SLIDE: return "previous_slide";
+            case CommandType::LIKE:           return "like";
+            case CommandType::DISLIKE:        return "dislike";
+            case CommandType::CALL:           return "call";
+            case CommandType::OK:             return "ok";
+            case CommandType::ROCK:           return "rock";
+            case CommandType::THREE:          return "three";
+            case CommandType::THREE2:         return "three2";
+            case CommandType::TIMEOUT:        return "timeout";
+            case CommandType::PALM_ATTENDANCE: return "attendance";
+            case CommandType::TAKE_PICTURE:   return "take_picture";
+            case CommandType::HEART:          return "heart";
+            case CommandType::HEART2:         return "heart2";
+            case CommandType::MID_FINGER:     return "mid_finger";
+            case CommandType::FOUR:           return "four";
+            case CommandType::THUMB_INDEX:    return "thumb_index";
+            case CommandType::HOLY:           return "holy";
+            case CommandType::ONE:            return "one";
+            case CommandType::TWO_UP:         return "two_up";
+            case CommandType::TRACK_POS:      return "track_position";
+            case CommandType::INIT:           return "init";
+            case CommandType::UNKNOWN:        return "unknown";
+        }
+        return "unknown";
+    }
+
 private:
-    void on_open(websocketpp::connection_hdl hdl) {
+    // Called when the WebSocket connection is successfully opened
+    void on_open(connection_hdl hdl) {
+        std::cout << "Connection established." << std::endl;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_connected = true;
-            m_reconnectAttempts = 0;
+            m_connecting = false;
+            m_reconnect_attempts = 0;
         }
+        m_cond.notify_all();
 
-        std::cout << "Connection opened" << std::endl;
-
-        json registration = {
+        // Immediately send registration JSON to identify as hardware client
+        json registration_msg = {
             {"register", "hardware"},
             {"id", m_clientId}
         };
-
         websocketpp::lib::error_code ec;
-        m_client.send(hdl, registration.dump(), websocketpp::frame::opcode::text, ec);
-
-        if (ec) {
-            std::cerr << "Error registering client: " << ec.message() << std::endl;
-        }
-
-        m_cv.notify_one();
-    }
-
-    void on_close(websocketpp::connection_hdl hdl) {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_connected = false;
-        }
-
-        auto conn = m_client.get_con_from_hdl(hdl);
-        std::cout << "Connection closed: " << conn->get_ec().message() << std::endl;
-
-        if (m_reconnectAttempts < m_maxReconnectAttempts) {
-            m_reconnectAttempts++;
-            std::cout << "Attempting reconnect " << m_reconnectAttempts 
-                      << " of " << m_maxReconnectAttempts << " in " 
-                      << m_reconnectDelayMs << "ms..." << std::endl;
-
-            std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::milliseconds(m_reconnectDelayMs));
-                connect();
-            }).detach();
-        }
-
-        m_cv.notify_one();
-    }
-
-    void on_fail(websocketpp::connection_hdl hdl) {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_connected = false;
-        }
-
-        auto conn = m_client.get_con_from_hdl(hdl);
-        std::cout << "Connection failed: " << conn->get_ec().message() << std::endl;
-
-        if (m_reconnectAttempts < m_maxReconnectAttempts) {
-            m_reconnectAttempts++;
-            std::cout << "Attempting reconnect " << m_reconnectAttempts 
-                      << " of " << m_maxReconnectAttempts << " in " 
-                      << m_reconnectDelayMs << "ms..." << std::endl;
-
-            std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::milliseconds(m_reconnectDelayMs));
-                connect();
-            }).detach();
-        }
-
-        m_cv.notify_one();
-    }
-
-    void on_message(websocketpp::connection_hdl hdl, message_ptr msg) {
         try {
-            json data = json::parse(msg->get_payload());
-            std::cout << "Received message: " << data.dump(2) << std::endl;
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Error processing message: " << e.what() << std::endl;
-        }
-    }
-
-    std::string commandTypeToString(CommandType command) {
-        switch (command) {
-            case CommandType::NEXT_SLIDE: return "next_slide";
-            case CommandType::PREVIOUS_SLIDE: return "previous_slide";
-            case CommandType::ZOOM_IN: return "zoom_in";
-            case CommandType::ZOOM_OUT: return "zoom_out";
-            case CommandType::START_PRESENTATION: return "start_presentation";
-            case CommandType::END_PRESENTATION: return "end_presentation";
-            case CommandType::GRANT_PERMISSION: return "grant_permission";
-            case CommandType::DENY_PERMISSION: return "deny_permission";
-            default: return "unknown";
+            if (!hdl.expired()) {
+                m_client.send(hdl, registration_msg.dump(), websocketpp::frame::opcode::text, ec);
+                if (ec) {
+                    std::cerr << "Failed to send registration: " << ec.message() << std::endl;
+                } else {
+                    std::cout << "Sent registration request." << std::endl;
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Exception sending registration: " << e.what() << std::endl;
         }
     }
 
-    websocket_client m_client;
-    websocketpp::connection_hdl m_hdl;
-    std::thread m_thread;
-    std::string m_uri;
-    std::string m_clientId;
-    bool m_connected;
-    int m_reconnectAttempts;
-    int m_maxReconnectAttempts;
-    int m_reconnectDelayMs;
-    std::mutex m_mutex;
-    std::condition_variable m_cv;
+    // Called when the WebSocket handshake or connection fails
+    void on_fail(connection_hdl hdl) {
+        std::string error_msg = "N/A";
+        auto con = m_client.get_con_from_hdl(hdl);
+        if (con) {
+            error_msg = con->get_ec().message();
+        }
+        std::cerr << "Connection attempt failed: " << error_msg << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_connected = false;
+            m_connecting = false;
+        }
+        m_cond.notify_all();
+        schedule_reconnect();  // Try again later
+    }
+
+    // Called when an established WebSocket connection closes
+    void on_close(connection_hdl hdl) {
+        std::string reason = "N/A";
+        auto con = m_client.get_con_from_hdl(hdl);
+        if (con) {
+            reason = con->get_remote_close_reason();
+        }
+        std::cout << "Connection closed. Reason: " << (reason.empty() ? "(unknown)" : reason) << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_connected = false;
+            m_connecting = false;
+        }
+        m_cond.notify_all();
+        if (!m_stop_requested) {
+            schedule_reconnect();  // Attempt to reconnect if not shutting down
+        }
+    }
+
+    // Called when a message arrives from the server
+    void on_message(connection_hdl hdl, message_ptr msg) {
+        const std::string& payload = msg->get_payload();
+        std::cout << "Received message from server: " << payload << std::endl;
+        try {
+            json data = json::parse(payload);
+            if (data.contains("type")) {
+                std::string type = data["type"];
+                if (type == "registration_success") {
+                    std::cout << "Registered successfully as ID: "
+                              << data.value("client_id", "[N/A]") << std::endl;
+                } else if (type == "error") {
+                    std::cerr << "Server Error: "
+                              << data.value("message", "(No details)") << std::endl;
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Error processing server message: " << e.what() << std::endl;
+        }
+    }
+
+    // Schedule a reconnect attempt with exponential backoff
+    void schedule_reconnect() {
+        if (m_stop_requested || m_connected || m_connecting) return;
+        m_reconnect_attempts++;
+        if (m_reconnect_attempts > m_max_reconnect_attempts) {
+            std::cerr << "Max reconnect attempts reached. Giving up." << std::endl;
+            return;
+        }
+        long long delay = m_reconnect_delay_ms * (1 << std::min(m_reconnect_attempts - 1, 4));
+        std::cout << "Reconnect attempt " << m_reconnect_attempts
+                  << "/" << m_max_reconnect_attempts
+                  << " in " << delay << "ms..." << std::endl;
+        std::thread([this, delay]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            if (!m_stop_requested && !m_connected && !m_connecting) {
+                connect();
+            }
+        }).detach();
+    }
+
+    // Member variables for the WebSocket++ client, state flags, and synchronization
+    client                     m_client;                 // WebSocket++ client object
+    connection_hdl             m_hdl;                    // Handle to the active connection
+    std::thread                m_client_thread;          // Thread running the ASIO loop
+    std::string                m_uri;                    // Server URI (ws://...)
+    std::string                m_clientId;               // Unique hardware client ID
+    std::atomic<bool>          m_connected;              // True if handshake completed
+    std::atomic<bool>          m_connecting;             // True while attempting to connect
+    std::atomic<bool>          m_stop_requested;         // True when shutting down
+    int                        m_reconnect_attempts;     // How many times we've retried
+    const int                  m_max_reconnect_attempts; // Cap for retries
+    const int                  m_reconnect_delay_ms;     // Base delay between retries
+    std::mutex                 m_mutex;                  // Synchronizes state flags
+    std::condition_variable    m_cond;                   // Signals connect/open events
 };
 
-// =================== GestureControlSystem =====================
-
+// Gesture Control System that reads from named pipe and sends to WebSocket
 class GestureControlSystem {
 public:
     GestureControlSystem(const std::string& serverUri, const std::string& clientId)
-        : m_webSocketClient(serverUri, clientId), m_isRunning(false) {}
+        : m_webSocketClient(serverUri, clientId), m_isRunning(false), m_pipefd(-1)
+    {}
 
     ~GestureControlSystem() {
         stop();
     }
 
+    // Initialize hardware resources and connect to server
     bool initialize() {
+        std::cout << "Initializing Gesture Control System..." << std::endl;
+        
+        // Wait for the Python script to create the pipe
+        std::cout << "Waiting for Python gesture recognition system..." << std::endl;
+        int attempts = 0;
+        while (attempts < 30) {  // Wait up to 30 seconds
+            if (access(PIPE_PATH.c_str(), F_OK) == 0) {
+                std::cout << "Found named pipe: " << PIPE_PATH << std::endl;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            attempts++;
+        }
+        
+        if (attempts >= 30) {
+            std::cerr << "Timeout waiting for Python script to create pipe: " << PIPE_PATH << std::endl;
+            return false;
+        }
+
+        // Open the named pipe for reading
+        m_pipefd = open(PIPE_PATH.c_str(), O_RDONLY);
+        if (m_pipefd == -1) {
+            perror("Failed to open named pipe");
+            return false;
+        }
+        std::cout << "Opened named pipe for reading." << std::endl;
+
+        std::cout << "Attempting WebSocket connection..." << std::endl;
         return m_webSocketClient.connect();
     }
 
-    bool start() {
+    // Start the processing thread to read from pipe and send to WebSocket
+    void start() {
         if (!m_webSocketClient.isConnected()) {
-            std::cerr << "Cannot start: WebSocket not connected" << std::endl;
-            return false;
+            std::cerr << "Cannot start: WebSocket not connected." << std::endl;
+            return;
         }
+        if (m_isRunning) return;
         m_isRunning = true;
-        m_tcpThread = std::thread(&GestureControlSystem::tcpListenerLoop, this);
-        return true;
+        m_processingThread = std::thread(&GestureControlSystem::processingLoop, this);
+        std::cout << "Gesture processing loop started." << std::endl;
     }
 
+    // Stop processing and shut down the WebSocket client
     void stop() {
+        if (!m_isRunning) return;
         m_isRunning = false;
-        if (m_tcpThread.joinable()) {
-            m_tcpThread.join();
+        
+        if (m_processingThread.joinable()) {
+            m_processingThread.join();
         }
+        
+        if (m_pipefd != -1) {
+            close(m_pipefd);
+            m_pipefd = -1;
+        }
+        
+        m_webSocketClient.stop();
+        std::cout << "Gesture Control System stopped." << std::endl;
     }
 
 private:
-    void tcpListenerLoop() {
-        int server_fd, new_socket;
-        struct sockaddr_in address;
-        int opt = 1;
-        int addrlen = sizeof(address);
-        char buffer[1024] = {0};
-
-        server_fd = socket(AF_INET, SOCK_STREAM, 0);
-        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = INADDR_ANY;
-        address.sin_port = htons(65432);
-
-        if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-            std::cerr << "TCP bind failed" << std::endl;
-            return;
-        }
-        if (listen(server_fd, 3) < 0) {
-            std::cerr << "TCP listen failed" << std::endl;
-            return;
-        }
-
-        std::cout << "TCP server listening on port 65432" << std::endl;
-
-        while (m_isRunning && (new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) >= 0) {
-            std::cout << "Client connected to TCP server" << std::endl;
-            int valread;
-            while (m_isRunning && (valread = read(new_socket, buffer, 1024)) > 0) {
-                buffer[valread] = '\0';
-                std::string cmd(buffer);
-                std::cout << "Received from Python: " << cmd << std::endl;
-
-                if (cmd.find("next_slide") != std::string::npos) {
-                    m_webSocketClient.sendCommand(CommandType::NEXT_SLIDE);
-                } else if (cmd.find("previous_slide") != std::string::npos) {
-                    m_webSocketClient.sendCommand(CommandType::PREVIOUS_SLIDE);
+    // Main loop: read from named pipe and forward to WebSocket
+    void processingLoop() {
+        std::cout << "Starting to listen for gesture commands from Python..." << std::endl;
+        
+        char buffer[1024];
+        std::string line_buffer;
+        
+        while (m_isRunning) {
+            // Read data from pipe
+            ssize_t bytes_read = read(m_pipefd, buffer, sizeof(buffer) - 1);
+            
+            if (bytes_read > 0) {
+                buffer[bytes_read] = '\0';
+                line_buffer += buffer;
+                
+                // Process complete lines (JSON messages end with newline)
+                size_t pos;
+                while ((pos = line_buffer.find('\n')) != std::string::npos) {
+                    std::string json_line = line_buffer.substr(0, pos);
+                    line_buffer.erase(0, pos + 1);
+                    
+                    if (!json_line.empty()) {
+                        processGestureMessage(json_line);
+                    }
+                }
+            } else if (bytes_read == 0) {
+                // EOF - Python script closed the pipe
+                std::cout << "Python script closed the pipe. Waiting for reconnection..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                
+                // Try to reopen the pipe
+                close(m_pipefd);
+                m_pipefd = open(PIPE_PATH.c_str(), O_RDONLY);
+                if (m_pipefd == -1) {
+                    std::cerr << "Failed to reopen pipe. Exiting..." << std::endl;
+                    break;
+                }
+            } else {
+                // Error reading from pipe
+                if (m_isRunning) {
+                    perror("Error reading from pipe");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
             }
-            close(new_socket);
-            std::cout << "TCP client disconnected" << std::endl;
         }
-
-        close(server_fd);
+        std::cout << "Exiting processing loop." << std::endl;
     }
 
-    WebSocketHardwareClient m_webSocketClient;
-    std::thread m_tcpThread;
-    bool m_isRunning;
+    // Process a JSON message received from Python
+    void processGestureMessage(const std::string& json_str) {
+        try {
+            json data = json::parse(json_str);
+            
+            if (data.contains("type") && data["type"] == "gesture") {
+                std::string command = data.value("command", "");
+                CommandType cmd_type = m_webSocketClient.stringToCommandType(command);
+                
+                if (cmd_type != CommandType::UNKNOWN) {
+                    std::cout << "Received gesture: " << command << std::endl;
+                    
+                    // Handle position data for tracking commands
+                    json position_data;
+                    if (data.contains("position")) {
+                        position_data = data["position"];
+                    }
+                    
+                    // Send command to WebSocket server
+                    if (m_webSocketClient.isConnected()) {
+                        bool sent = m_webSocketClient.sendCommand(cmd_type, position_data);
+                        if (!sent) {
+                            std::cerr << "Failed to send command: " << command << std::endl;
+                        }
+                    } else {
+                        std::cout << "WebSocket not connected. Skipping command: " << command << std::endl;
+                    }
+                } else {
+                    std::cout << "Unknown gesture command: " << command << std::endl;
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Error parsing JSON message: " << e.what() << std::endl;
+            std::cerr << "Message was: " << json_str << std::endl;
+        }
+    }
+
+    WebSocketHardwareClient    m_webSocketClient;  // Underlying WS client
+    std::thread                m_processingThread; // Thread for the loop
+    std::atomic<bool>          m_isRunning;        // Loop control flag
+    int                        m_pipefd;           // File descriptor for named pipe
 };
 
-// =================== MAIN =====================
-
 int main(int argc, char* argv[]) {
-    std::string serverUri = "ws://localhost:8080";
-    std::string clientId = "raspberry-pi-gesture";
+    // Default server URI and hardware client ID
+    std::string discoveredIp = discoverDesktopIP();
 
-    if (argc > 1) { serverUri = argv[1]; }
-    if (argc > 2) { clientId = argv[2]; }
+    std::string serverUri = discoveredIp.empty() ? "ws://localhost:8080" : ("ws://" + discoveredIp + ":8080");
+    std::string clientId  = "hardware-pi-01";
 
-    try {
-        std::cout << "Starting Gesture Control Hardware Client" << std::endl;
-        std::cout << "Server URI: " << serverUri << std::endl;
-        std::cout << "Client ID: " << clientId << std::endl;
+    // Override defaults via command-line arguments
+    if (argc > 1) serverUri = argv[1];
+    if (argc > 2) clientId  = argv[2];
 
-        GestureControlSystem system(serverUri, clientId);
+    std::cout << "--- AirClass Hardware Client ---" << std::endl;
+    std::cout << "Server URI: " << serverUri << std::endl;
+    std::cout << "Client ID : " << clientId << std::endl;
+    std::cout << "Named Pipe: " << PIPE_PATH << std::endl;
 
-        if (!system.initialize()) {
-            std::cerr << "Failed to initialize the system" << std::endl;
-            return 1;
-        }
-
-        if (!system.start()) {
-            std::cerr << "Failed to start the system" << std::endl;
-            return 1;
-        }
-
-        std::cout << "System running. Press Enter to exit." << std::endl;
-        std::cin.get();
-
-        system.stop();
-        std::cout << "System stopped" << std::endl;
-    }
-    catch (const std::exception& e) {
-        std::cerr << "Exception: " << e.what() << std::endl;
+    // Instantiate and initialize the gesture system
+    GestureControlSystem gestureSystem(serverUri, clientId);
+    if (!gestureSystem.initialize()) {
+        std::cerr << "FATAL: Could not initialize hardware client. Exiting." << std::endl;
         return 1;
     }
 
+    // Begin gesture processing
+    gestureSystem.start();
+
+    // Wait for user input to terminate
+    std::cout << "Hardware client running. Press Enter to exit." << std::endl;
+    std::cin.get();
+
+    std::cout << "Shutdown requested..." << std::endl;
+    gestureSystem.stop();
+    std::cout << "Hardware client finished." << std::endl;
     return 0;
 }
