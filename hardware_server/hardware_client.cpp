@@ -36,26 +36,24 @@ const std::string PIPE_PATH = "/tmp/gesture_pipe";
 enum class CommandType {
     NEXT_SLIDE,
     PREVIOUS_SLIDE,
-    LIKE,
-    DISLIKE,
+    ACCEPT,
+    DECLINE,
     CALL,
     OK,
     ROCK,
-    THREE,
+    ZOOM_IN,
     THREE2,
     TIMEOUT,
-    PALM_ATTENDANCE,
+    PALM_ATTENTION,
     TAKE_PICTURE,
     HEART,
     HEART2,
     MID_FINGER,
-    FOUR,
+    ZOOM_OUT,
     THUMB_INDEX,
     HOLY,
-    ONE,
-    TWO_UP,
-    TRACK_POS,
-    INIT,
+    DRAW,
+    POINTER,
     UNKNOWN    // Fallback if gesture not recognized
 };
 
@@ -72,56 +70,41 @@ std::string discoverDesktopIP(int port = 9999, const std::string& broadcastMessa
         close(sock);
         return "";
     }
+    printf("girdi\n");
 
     sockaddr_in broadcastAddr{};
     broadcastAddr.sin_family = AF_INET;
     broadcastAddr.sin_port = htons(port);
     broadcastAddr.sin_addr.s_addr = inet_addr("255.255.255.255");
 
+    ssize_t sent = sendto(sock, broadcastMessage.c_str(), broadcastMessage.length(), 0,
+                          (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
+    if (sent < 0) {
+        perror("sendto");
+        close(sock);
+        return "";
+    }
+
+    std::cout << "[UDP] Broadcast gönderildi, cevap bekleniyor...\n";
+
     sockaddr_in fromAddr{};
     socklen_t fromLen = sizeof(fromAddr);
     char buffer[128];
-
-    while (true) {
-        // Send discovery message
-        ssize_t sent = sendto(sock, broadcastMessage.c_str(), broadcastMessage.length(), 0,
-                              (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
-        if (sent < 0) {
-            perror("sendto");
-        } else {
-            std::cout << "[UDP] Broadcast gönderildi, cevap bekleniyor...\n";
-        }
-
-        // Set 2-second receive timeout
-        struct timeval tv = {2, 0};
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-        // Try receiving response
-        ssize_t recvLen = recvfrom(sock, buffer, sizeof(buffer) - 1, 0,
-                                   (sockaddr*)&fromAddr, &fromLen);
-        if (recvLen > 0) {
-            buffer[recvLen] = '\0';
-            std::string desktopIp(buffer);
-
-            // Check if received data looks like a valid IP (basic check)
-            if (!desktopIp.empty() && desktopIp.find('.') != std::string::npos) {
-                std::cout << "[UDP] Masaüstü IP adresi bulundu: " << desktopIp << std::endl;
-                close(sock);
-                return desktopIp;
-            } else {
-                std::cerr << "[UDP] Geçersiz IP cevabı alındı: '" << desktopIp << "'\n";
-            }
-        } else {
-            std::cout << "[UDP] Cevap alınamadı, yeniden deneniyor...\n";
-        }
-
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+    ssize_t recvLen = recvfrom(sock, buffer, sizeof(buffer) - 1, 0,
+                               (sockaddr*)&fromAddr, &fromLen);
+    if (recvLen < 0) {
+        perror("recvfrom");
+        close(sock);
+        return "";
     }
 
-    close(sock);
-    return "";
-}
+    buffer[recvLen] = '\0';
+    std::string desktopIp(buffer);
 
+    close(sock);
+    std::cout << "[UDP] Masaüstü IP adresi: " << desktopIp << std::endl;
+    return desktopIp;
+}
 
 class WebSocketHardwareClient {
 public:
@@ -304,26 +287,26 @@ public:
     CommandType stringToCommandType(const std::string& command) {
         if (command == "next_slide") return CommandType::NEXT_SLIDE;
         if (command == "previous_slide") return CommandType::PREVIOUS_SLIDE;
-        if (command == "like") return CommandType::LIKE;
-        if (command == "dislike") return CommandType::DISLIKE;
+        if (command == "accept") return CommandType::ACCEPT;
+        if (command == "decline") return CommandType::DECLINE;
         if (command == "call") return CommandType::CALL;
         if (command == "ok") return CommandType::OK;
         if (command == "rock") return CommandType::ROCK;
-        if (command == "three") return CommandType::THREE;
+        if (command == "zoom_in") return CommandType::ZOOM_IN;
         if (command == "three2") return CommandType::THREE2;
         if (command == "timeout") return CommandType::TIMEOUT;
-        if (command == "Attendance") return CommandType::PALM_ATTENDANCE;
-        if (command == "take_picture") return CommandType::TAKE_PICTURE;
+        if (command == "attention") return CommandType::PALM_ATTENTION;
+        if (command == "attendance") return CommandType::TAKE_PICTURE;
         if (command == "heart") return CommandType::HEART;
         if (command == "heart2") return CommandType::HEART2;
         if (command == "mid_finger") return CommandType::MID_FINGER;
-        if (command == "four") return CommandType::FOUR;
+        if (command == "zoom_out") return CommandType::ZOOM_OUT;
         if (command == "thumb_index") return CommandType::THUMB_INDEX;
         if (command == "holy") return CommandType::HOLY;
-        if (command == "one") return CommandType::ONE;
-        if (command == "two_up") return CommandType::TWO_UP;
-        if (command == "TRACK_POS") return CommandType::TRACK_POS;
-        if (command == "init") return CommandType::INIT;
+        if (command == "draw") return CommandType::DRAW;
+        if (command == "pointer") return CommandType::POINTER;
+        // if (command == "TRACK_POS") return CommandType::TRACK_POS;
+        // if (command == "init") return CommandType::INIT;
         return CommandType::UNKNOWN;
     }
 
@@ -332,26 +315,26 @@ public:
         switch (command) {
             case CommandType::NEXT_SLIDE:     return "next_slide";
             case CommandType::PREVIOUS_SLIDE: return "previous_slide";
-            case CommandType::LIKE:           return "like";
-            case CommandType::DISLIKE:        return "dislike";
+            case CommandType::ACCEPT:           return "accept";
+            case CommandType::DECLINE:        return "decline";
             case CommandType::CALL:           return "call";
             case CommandType::OK:             return "ok";
             case CommandType::ROCK:           return "rock";
-            case CommandType::THREE:          return "three";
+            case CommandType::ZOOM_IN:        return "zoom_in";
             case CommandType::THREE2:         return "three2";
             case CommandType::TIMEOUT:        return "timeout";
-            case CommandType::PALM_ATTENDANCE: return "attendance";
-            case CommandType::TAKE_PICTURE:   return "take_picture";
+            case CommandType::PALM_ATTENTION: return "attention";
+            case CommandType::TAKE_PICTURE:   return "attendance";
             case CommandType::HEART:          return "heart";
             case CommandType::HEART2:         return "heart2";
             case CommandType::MID_FINGER:     return "mid_finger";
-            case CommandType::FOUR:           return "four";
+            case CommandType::ZOOM_OUT:       return "zoom_out";
             case CommandType::THUMB_INDEX:    return "thumb_index";
             case CommandType::HOLY:           return "holy";
-            case CommandType::ONE:            return "one";
-            case CommandType::TWO_UP:         return "two_up";
-            case CommandType::TRACK_POS:      return "track_position";
-            case CommandType::INIT:           return "init";
+            case CommandType::DRAW:            return "draw";
+            case CommandType::POINTER:         return "pointer";
+            // case CommandType::TRACK_POS:      return "track_position";
+            // case CommandType::INIT:           return "init";
             case CommandType::UNKNOWN:        return "unknown";
         }
         return "unknown";
@@ -621,6 +604,7 @@ private:
                     json position_data;
                     if (data.contains("position")) {
                         position_data = data["position"];
+                        std::cout << "Position data: " << position_data.dump() << std::endl;
                     }
                     
                     // Send command to WebSocket server
@@ -651,8 +635,9 @@ private:
 int main(int argc, char* argv[]) {
     // Default server URI and hardware client ID
     std::string discoveredIp = discoverDesktopIP();
-
+    std::cout << "Discovered desktop IP: " << discoveredIp << std::endl;
     std::string serverUri = discoveredIp.empty() ? "ws://localhost:8080" : ("ws://" + discoveredIp + ":8080");
+    // std::string serverUri = "ws://10.1.248.114:8082"; 
     std::string clientId  = "hardware-pi-01";
 
     // Override defaults via command-line arguments
