@@ -42,20 +42,18 @@ enum class CommandType {
     OK,
     ROCK,
     THREE,
-    THREE2,
+    THREE_2,
     TIMEOUT,
     PALM_ATTENDANCE,
     TAKE_PICTURE,
     HEART,
-    HEART2,
+    HEART_2,
     MID_FINGER,
     FOUR,
     THUMB_INDEX,
     HOLY,
     ONE,
     TWO_UP,
-    TRACK_POS,
-    INIT,
     UNKNOWN    // Fallback if gesture not recognized
 };
 
