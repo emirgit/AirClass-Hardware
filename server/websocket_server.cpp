@@ -1,238 +1,296 @@
+// Include WebSocket++ headers (ASIO transport, no TLS for simplicity)
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
+
+// Standard Library includes
 #include <iostream>
 #include <map>
 #include <set>
 #include <string>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <cstdlib>
+#include <stdexcept>
+
+// JSON library for message parsing/serialization
 #include <nlohmann/json.hpp>
 
-// For convenience
+// Convenient aliases
 using json = nlohmann::json;
 using websocketpp::lib::placeholders::_1;
 using websocketpp::lib::placeholders::_2;
 using websocketpp::connection_hdl;
 
-// Define server type with chosen config
+// Define our server type using WebSocket++ with ASIO
 typedef websocketpp::server<websocketpp::config::asio> server;
+typedef server::message_ptr message_ptr;
 
-enum ClientType {
+// Enumeration of client roles for routing logic
+enum class ClientType {
     HARDWARE,
     DESKTOP,
     MOBILE,
-    UNKNOWN
+    UNKNOWN // Before the client registers
 };
 
+// Stores per-connection metadata
 struct ClientInfo {
-    connection_hdl hdl;
-    ClientType type;
-    std::string id;
+    ClientType type = ClientType::UNKNOWN;  // Role of this client
+    std::string id = "";                    // Client-provided unique ID
 };
 
-class ClassroomWebSocketServer {
+class AirClassServer {
 public:
-    ClassroomWebSocketServer() {
-        // Set logging settings
-        m_server.set_access_channels(websocketpp::log::alevel::all);
-        m_server.clear_access_channels(websocketpp::log::alevel::frame_payload);
+    AirClassServer() {
+        // Configure WebSocket++ logging: only show connect/disconnect/app logs
+        m_server.clear_access_channels(websocketpp::log::alevel::all);
+        m_server.set_access_channels(websocketpp::log::alevel::connect);
+        m_server.set_access_channels(websocketpp::log::alevel::disconnect);
+        m_server.set_access_channels(websocketpp::log::alevel::app);
 
-        // Initialize ASIO
+        // Initialize ASIO subsystem
         m_server.init_asio();
 
-        // Set callback handlers
-        m_server.set_open_handler(bind(&ClassroomWebSocketServer::on_open, this, _1));
-        m_server.set_close_handler(bind(&ClassroomWebSocketServer::on_close, this, _1));
-        m_server.set_message_handler(bind(&ClassroomWebSocketServer::on_message, this, _1, _2));
+        // Register callback handlers for lifecycle events
+        m_server.set_open_handler(bind(&AirClassServer::on_open, this, _1));
+        m_server.set_close_handler(bind(&AirClassServer::on_close, this, _1));
+        m_server.set_message_handler(bind(&AirClassServer::on_message, this, _1, _2));
     }
 
+    // Starts listening on the given port and runs the ASIO loop
     void run(uint16_t port) {
-        // Listen on specified port
-        m_server.listen(port);
-        
-        // Start the server accept loop
-        m_server.start_accept();
-        
-        // Start the ASIO io_service run loop
-        std::cout << "WebSocket Server started on port " << port << std::endl;
-        m_server.run();
+        try {
+            m_server.listen(port);        // Bind socket to port
+            m_server.start_accept();      // Begin accepting connections
+            std::cout << "WebSocket Server started on port " << port << std::endl;
+            m_server.run();               // Enter the event loop (blocks)
+        } catch (const websocketpp::exception& e) {
+            std::cerr << "WebSocket Exception: " << e.what() << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Standard Exception during run: " << e.what() << std::endl;
+        }
+    }
+
+    // Gracefully shuts down all connections and stops the server loop
+    void stop() {
+        std::lock_guard<std::mutex> guard(m_connection_lock);
+
+        // Close each open connection with a "going_away" status
+        for (auto const& [hdl, info] : m_connections) {
+            try {
+                if (!hdl.expired()) {
+                    m_server.close(hdl, websocketpp::close::status::going_away, "Server shutdown");
+                }
+            } catch (const websocketpp::exception& e) {
+                std::cerr << "Exception closing connection: " << e.what() << std::endl;
+            }
+        }
+        m_connections.clear();
+
+        // Stop accepting new connections and exit the ASIO loop
+        m_server.stop_listening();
+        m_server.stop();
+        std::cout << "WebSocket Server stopped." << std::endl;
     }
 
 private:
+    // Handler: new client connection opened
     void on_open(connection_hdl hdl) {
-        std::cout << "New connection opened" << std::endl;
-        
-        // Add to connections set (unidentified at first)
-        ClientInfo info;
-        info.hdl = hdl;
-        info.type = UNKNOWN;
-        info.id = "";
-        
-        m_connections[hdl] = info;
+        std::lock_guard<std::mutex> guard(m_connection_lock);
+        // Initialize ClientInfo with UNKNOWN type
+        m_connections[hdl] = std::make_shared<ClientInfo>();
+        std::cout << "Connection opened. Awaiting registration." << std::endl;
     }
 
+    // Handler: client connection closed
     void on_close(connection_hdl hdl) {
-        std::cout << "Connection closed" << std::endl;
-        
+        std::lock_guard<std::mutex> guard(m_connection_lock);
         auto it = m_connections.find(hdl);
         if (it != m_connections.end()) {
-            if (it->second.type != UNKNOWN) {
-                std::cout << "Client disconnected: " 
-                          << clientTypeToString(it->second.type) 
-                          << " ID: " << it->second.id << std::endl;
-            }
+            // Log the disconnected client's type and ID
+            std::cout << "Client disconnected: Type=" 
+                      << clientTypeToString(it->second->type)
+                      << ", ID=" << (it->second->id.empty() ? "[unregistered]" : it->second->id)
+                      << std::endl;
             m_connections.erase(it);
+        } else {
+            std::cout << "Connection closed (already removed or unknown)." << std::endl;
         }
     }
 
-    void on_message(connection_hdl hdl, server::message_ptr msg) {
+    // Handler: message received from a client
+    void on_message(connection_hdl hdl, message_ptr msg) {
+        std::shared_ptr<ClientInfo> sender_info;
+        ClientType sender_type = ClientType::UNKNOWN;
+        std::string payload = msg->get_payload();  // Extract raw message
+
+        {   // Retrieve sender metadata under lock
+            std::lock_guard<std::mutex> guard(m_connection_lock);
+            auto it = m_connections.find(hdl);
+            if (it == m_connections.end()) {
+                std::cerr << "Error: Message from unknown connection." << std::endl;
+                return;
+            }
+            sender_info = it->second;
+            sender_type = sender_info->type;
+        }
+
+        // 1) If not yet registered, handle registration flow
+        if (sender_type == ClientType::UNKNOWN) {
+            handle_registration(hdl, sender_info, payload);
+            return;
+        }
+
+        // 2) Already registered: log incoming message
+        std::cout << "Received message from " << clientTypeToString(sender_type)
+                  << " (ID: " << sender_info->id << "): " << payload << std::endl;
+
+        // Determine where to forward based on sender role
+        ClientType target_type = ClientType::UNKNOWN;
+        if (sender_type == ClientType::HARDWARE) {
+            target_type = ClientType::DESKTOP;
+        } else if (sender_type == ClientType::DESKTOP) {
+            target_type = ClientType::MOBILE;
+        } else if (sender_type == ClientType::MOBILE) {
+            target_type = ClientType::DESKTOP;
+        } else {
+            std::cerr << "Warning: Unexpected sender type post-registration." << std::endl;
+            return;
+        }
+
+        // 3) Forward the payload to all clients of the target type
+        forward_message_to_type(payload, msg->get_opcode(), target_type);
+    }
+
+    // Parses and validates client registration messages
+    void handle_registration(connection_hdl hdl,
+                             std::shared_ptr<ClientInfo> client_info,
+                             const std::string& payload) {
         try {
-            auto& client = m_connections[hdl];
-            
-            // Parse JSON message
-            json data = json::parse(msg->get_payload());
-            
-            // Handle client registration if needed
-            if (client.type == UNKNOWN && data.contains("register")) {
-                registerClient(hdl, data);
+            json data = json::parse(payload);
+
+            // Check required fields
+            if (!data.contains("register") || !data.contains("id")) {
+                send_error(hdl, "Registration requires 'register' and 'id'.");
                 return;
             }
-            
-            // Process various message types
-            if (data.contains("type")) {
-                std::string msgType = data["type"];
-                
-                std::cout << "Received message type: " << msgType 
-                          << " from " << clientTypeToString(client.type) 
-                          << " ID: " << client.id << std::endl;
-                
-                // Process based on message type
-                if (msgType == "gesture_command") {
-                    // Forward gesture commands to desktop applications
-                    forwardToDesktop(data);
-                }
-                else if (msgType == "attendance") {
-                    // Forward attendance data to desktop applications
-                    forwardToDesktop(data);
-                }
-                else if (msgType == "speak_request") {
-                    // Forward speak requests to desktop applications
-                    forwardToDesktop(data);
-                }
-                else if (msgType == "permission_grant") {
-                    // Forward permission grants to specific mobile clients
-                    if (data.contains("target_id")) {
-                        forwardToSpecificMobile(data["target_id"], data);
-                    }
-                }
-                else {
-                    // Broadcast other messages to all clients except sender
-                    broadcastMessage(msg->get_payload(), hdl);
-                }
+
+            std::string type_str = data["register"];
+            std::string client_id = data["id"];
+            if (client_id.empty()) {
+                send_error(hdl, "Client ID cannot be empty.");
+                return;
             }
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Error processing message: " << e.what() << std::endl;
-            
-            // Send error response
-            json error = {
-                {"type", "error"},
-                {"message", "Invalid message format"}
+
+            // Map string to enum
+            ClientType new_type = ClientType::UNKNOWN;
+            if (type_str == "hardware") new_type = ClientType::HARDWARE;
+            else if (type_str == "desktop") new_type = ClientType::DESKTOP;
+            else if (type_str == "mobile") new_type = ClientType::MOBILE;
+            else {
+                send_error(hdl, "Invalid client type: " + type_str);
+                return;
+            }
+
+            // Update metadata and confirm registration
+            client_info->type = new_type;
+            client_info->id = client_id;
+            std::cout << "Client registered: Type=" 
+                      << clientTypeToString(new_type)
+                      << ", ID=" << client_id << std::endl;
+
+            json confirmation = {
+                {"type", "registration_success"},
+                {"client_type", clientTypeToString(new_type)},
+                {"client_id", client_id}
             };
-            
-            m_server.send(hdl, error.dump(), msg->get_opcode());
+            m_server.send(hdl, confirmation.dump(), websocketpp::frame::opcode::text);
+
+        } catch (const json::parse_error& e) {
+            send_error(hdl, "Invalid JSON for registration.");
+        } catch (const std::exception& e) {
+            std::cerr << "Registration error: " << e.what() << std::endl;
+            send_error(hdl, "Internal server error.");
         }
     }
-    
-    void registerClient(connection_hdl hdl, const json& data) {
-        auto& client = m_connections[hdl];
-        
-        if (data["register"] == "hardware") {
-            client.type = HARDWARE;
-            client.id = data.value("id", "hardware-" + std::to_string(m_nextId++));
+
+    // Broadcasts a message payload to all clients of a given type
+    void forward_message_to_type(const std::string& payload,
+                                 websocketpp::frame::opcode::value opcode,
+                                 ClientType target_type) {
+        std::lock_guard<std::mutex> guard(m_connection_lock);
+        int sent_count = 0;
+
+        for (auto const& [hdl, info] : m_connections) {
+            if (info->type == target_type) {
+                try {
+                    if (!hdl.expired()) {
+                        m_server.send(hdl, payload, opcode);
+                        sent_count++;
+                    }
+                } catch (const websocketpp::exception& e) {
+                    std::cerr << "Send error to ID " << info->id << ": " << e.what() << std::endl;
+                }
+            }
         }
-        else if (data["register"] == "desktop") {
-            client.type = DESKTOP;
-            client.id = data.value("id", "desktop-" + std::to_string(m_nextId++));
-        }
-        else if (data["register"] == "mobile") {
-            client.type = MOBILE;
-            client.id = data.value("id", "mobile-" + std::to_string(m_nextId++));
-        }
-        
-        std::cout << "Client registered as " << clientTypeToString(client.type) 
-                  << " with ID: " << client.id << std::endl;
-        
-        // Send confirmation
-        json confirmation = {
-            {"type", "registration_success"},
-            {"client_type", clientTypeToString(client.type)},
-            {"client_id", client.id}
+        std::cout << "Forwarded message to " << sent_count
+                  << " client(s) of type " << clientTypeToString(target_type) << std::endl;
+    }
+
+    // Sends a structured error JSON to a single client
+    void send_error(connection_hdl hdl, const std::string& error_message) {
+        json error_json = {
+            {"type", "error"},
+            {"message", error_message}
         };
-        
-        m_server.send(hdl, confirmation.dump(), websocketpp::frame::opcode::text);
-    }
-    
-    void forwardToDesktop(const json& message) {
-        std::string msgStr = message.dump();
-        
-        for (auto& pair : m_connections) {
-            if (pair.second.type == DESKTOP) {
-                m_server.send(pair.second.hdl, msgStr, websocketpp::frame::opcode::text);
+        try {
+            if (!hdl.expired()) {
+                m_server.send(hdl, error_json.dump(), websocketpp::frame::opcode::text);
             }
+        } catch (const websocketpp::exception& e) {
+            std::cerr << "Failed to send error: " << e.what() << std::endl;
         }
     }
-    
-    void forwardToSpecificMobile(const std::string& targetId, const json& message) {
-        std::string msgStr = message.dump();
-        
-        for (auto& pair : m_connections) {
-            if (pair.second.type == MOBILE && pair.second.id == targetId) {
-                m_server.send(pair.second.hdl, msgStr, websocketpp::frame::opcode::text);
-                return;
-            }
-        }
-        
-        std::cerr << "Target mobile client not found: " << targetId << std::endl;
-    }
-    
-    void broadcastMessage(const std::string& message, connection_hdl excludeHdl) {
-        for (auto& pair : m_connections) {
-            // Don't send back to the sender
-            if (pair.first.lock() != excludeHdl.lock()) {
-                m_server.send(pair.second.hdl, message, websocketpp::frame::opcode::text);
-            }
-        }
-    }
-    
+
+    // Utility: convert ClientType enum to a readable string
     std::string clientTypeToString(ClientType type) {
         switch (type) {
-            case HARDWARE: return "Hardware";
-            case DESKTOP: return "Desktop";
-            case MOBILE: return "Mobile";
-            default: return "Unknown";
+            case ClientType::HARDWARE: return "Hardware";
+            case ClientType::DESKTOP:  return "Desktop";
+            case ClientType::MOBILE:   return "Mobile";
+            case ClientType::UNKNOWN:  return "Unknown";
         }
+        return "InvalidType";
     }
 
-    server m_server;
-    std::map<connection_hdl, ClientInfo, std::owner_less<connection_hdl>> m_connections;
-    int m_nextId = 1;
+    server m_server;  // Underlying WebSocket++ server instance
+    // Maps connection handles to their associated client metadata
+    std::map<connection_hdl, std::shared_ptr<ClientInfo>, std::owner_less<connection_hdl>> m_connections;
+    std::mutex m_connection_lock;  // Protects m_connections across threads
 };
 
 int main(int argc, char* argv[]) {
-    // Default port
-    uint16_t port = 8080;
-    
-    // Allow port to be specified as command line argument
-    if (argc > 1) {
-        port = std::stoi(argv[1]);
+    uint16_t port = 8080;  // Default listening port
+
+    // Attempt to read Render.com-provided PORT env var first
+    if (const char* env_port = std::getenv("PORT")) {
+        try {
+            port = std::stoi(env_port);
+        } catch (...) {
+            std::cerr << "Warning: Invalid PORT env var, using default " << port << "." << std::endl;
+        }
     }
-    
-    try {
-        ClassroomWebSocketServer server;
-        server.run(port);
-    } catch (const std::exception& e) {
-        std::cerr << "Exception: " << e.what() << std::endl;
+    // Otherwise, fall back to a CLI argument if provided
+    else if (argc > 1) {
+        try {
+            port = std::stoi(argv[1]);
+        } catch (...) {
+            std::cerr << "Warning: Invalid port arg, using default " << port << "." << std::endl;
+        }
     }
-    
+
+    AirClassServer server_instance;
+    server_instance.run(port);  // Start the server event loop
     return 0;
 }
