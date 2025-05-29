@@ -385,15 +385,15 @@ def handle_gesture(frame, gesture_text, landmarks, is_right_hand=True):
                     send_websocket("take_picture")
                 elif gesture_text == "heart":
                     send_websocket("heart")
-                elif gesture_text == "heart2":
-                    send_websocket("heart2")
+                elif gesture_text == "heart_2":
+                    send_websocket("heart_2")
                 elif gesture_text == "mid_finger":
                     send_websocket("mid_finger")
                 elif gesture_text == "thumb_index":
                     send_websocket("thumb_index")
                 elif gesture_text == "holy":
                     send_websocket("holy")
-                elif gesture_text == "three3":
+                elif gesture_text == "three_3":
                     send_websocket(gesture_text)
                     
             last_tracked_gesture = gesture_text
