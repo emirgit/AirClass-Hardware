@@ -12,22 +12,40 @@ import os
 import stat
 import signal
 import sys
+from picamera2 import Picamera2
+from libcamera import controls
 
 DEBUG = True
-gesture_threshold = 200
+gesture_threshold = 400
 GESTURE_COOLDOWN = 1
 TWO_UP_DISTANCE_THRESHOLD = 0.05  # İki parmak arası mesafe eşiği 
 DRAWING_MODE = False  # İzleme modu başlangıçta kapalı
 last_tracked_gesture = None
 model = load_model('gesture_recognizer.keras')
 
+# Zoom mode configuration
+ZOOM_CONFIG = {
+    "toggle_gesture": "ok",  # The gesture that toggles zoom mode
+    "active": False            # Zoom mode starts inactive
+}
+
 # Named pipe for interprocess communication
 PIPE_PATH = "/tmp/gesture_pipe"
 
-# Add these variables at the top with other global variables
 both_hands_detected_time = None
 both_hands_stable_duration = 0.5  # Require both hands to be present for 0.5 seconds
 BOTH_HANDS_REQUIRED_GESTURES = ["take_picture", "timeout", "heart", "heart2"]  # Gestures that need both hands to form
+
+def clear_websocket_file():
+    """Clear the websocket.txt file at program startup"""
+    if DEBUG:
+        try:
+            # Create an empty file (or truncate existing file)
+            with open('websocket.txt', 'w') as f:
+                pass
+            print("Websocket debug file cleared")
+        except Exception as e:
+            print(f"Error clearing websocket file: {e}")
 
 # Updated setup_pipe function for the Python script
 def setup_pipe():
@@ -62,6 +80,10 @@ def cleanup_handler(sig, frame):
             os.close(pipe_fd)
         if os.path.exists(PIPE_PATH):
             os.unlink(PIPE_PATH)
+        # Stop and close Pi Camera
+        if 'picam2' in globals():
+            picam2.stop()
+            picam2.close()
     except Exception as e:
         print(f"Error during cleanup: {e}")
     finally:
@@ -84,8 +106,7 @@ try:
 except FileNotFoundError:
     print("You should provide label_encoder")
     exit(-1)
-
-# Add function to check if both hands are present
+    
 def both_hands_present(results):
     """
     Check if both hands are detected in the current frame
@@ -124,20 +145,17 @@ def calculate_angle(p1, p2, p3):
 # Added gesture handling function similar to the one in paste-1.txt
 last_gesture_time = 0
 
-# Updated send_websocket function to handle pipe opening
+# Updated send_websocket function with DEBUG mode
 def send_websocket(command, position_data=None):
     """
     Send command to the C++ program via the named pipe
-    Formats the data as JSON with standardized fields
+    When DEBUG is True, writes to websocket.txt file instead
     """
     global pipe_fd
     
     # Create a JSON message that matches the expected format in the C++ client
     message = {
-        "type": "gesture",
         "command": command,
-        "source": "hardware",
-        "timestamp": time.time()
     }
     
     # Add position data if provided (for tracking mode)
@@ -147,6 +165,7 @@ def send_websocket(command, position_data=None):
     # Convert to JSON string and add newline for message separation
     json_str = json.dumps(message) + "\n"
     
+    # Non-DEBUG mode: Use named pipe as before
     try:
         # Open pipe for writing if not already open
         if pipe_fd is None:
@@ -157,7 +176,7 @@ def send_websocket(command, position_data=None):
                 if e.errno == 6:  # No such device or address
                     # No reader connected yet, skip this message
                     if DEBUG:
-                        print(f"No reader connected, skipping: {command}")
+                        print(f"Command: {command}")
                     return
                 else:
                     raise
@@ -187,7 +206,45 @@ def send_websocket(command, position_data=None):
                 pass
             pipe_fd = None
 
-# Modified handle_gesture function to include both-hands check
+# First, update the toggle_zoom_mode function to accept a specific direction parameter
+def toggle_zoom_mode(direction=None):
+    """
+    Toggle between normal mode and zoom mode
+    direction: "on" to force zoom mode on, "off" to force zoom mode off, None to toggle
+    """
+    global ZOOM_CONFIG
+    
+    if direction == "on":
+        
+        send_websocket("zoom_in")
+        # Only change if not already in zoom mode
+        if not ZOOM_CONFIG["active"]:
+            ZOOM_CONFIG["active"] = True
+            print("Mode switched to: ZOOM MODE")
+        
+        return True
+    
+    elif direction == "off":
+        # Only change if currently in zoom mode
+        if ZOOM_CONFIG["active"]:
+            ZOOM_CONFIG["active"] = False
+            print("Mode switched to: NORMAL MODE")
+            return False
+        return ZOOM_CONFIG["active"]  # Already in normal mode
+    
+    else:
+        # Toggle behavior (original functionality)
+        ZOOM_CONFIG["active"] = not ZOOM_CONFIG["active"]
+        mode_name = "ZOOM" if ZOOM_CONFIG["active"] else "NORMAL"
+        print(f"Mode switched to: {mode_name} MODE")
+        
+        # Only send zoom_in command when activating zoom mode
+        if ZOOM_CONFIG["active"]:
+            send_websocket("zoom_in")
+        
+        return ZOOM_CONFIG["active"]
+
+# Now modify the gesture handler to use these specific directions
 def handle_gesture(frame, gesture_text, landmarks, is_right_hand=True, both_hands_active=False):
     global last_gesture_time, gesture_threshold, DRAWING_MODE, last_tracked_gesture
     current_time = time.time()
@@ -197,6 +254,37 @@ def handle_gesture(frame, gesture_text, landmarks, is_right_hand=True, both_hand
         frame_height = frame.shape[0]
         frame_width = frame.shape[1]
 
+        # Check for "ok" gesture to switch TO zoom mode
+        if gesture_text == "ok" and current_time - last_gesture_time >= GESTURE_COOLDOWN:
+            # Switch to zoom mode
+            is_zoom_mode = toggle_zoom_mode(direction="on")
+            
+            # Display zoom mode indicator on frame
+            if DEBUG:
+                mode_text = "ZOOM MODE ACTIVE"
+                mode_color = (0, 0, 255)
+                cv2.putText(frame, mode_text, (frame_width - 300, 50), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, mode_color, 2, cv2.LINE_AA)
+            
+            last_gesture_time = current_time
+            return frame
+
+        # Check for "palm" gesture ABOVE threshold to switch BACK to normal mode
+        if gesture_text == "palm" and int(landmarks[0].y * frame_height) < gesture_threshold and ZOOM_CONFIG["active"]:
+            if current_time - last_gesture_time >= GESTURE_COOLDOWN:
+                # Switch back to normal mode
+                toggle_zoom_mode(direction="off")
+                send_websocket("zoom_reset")
+                
+                if DEBUG:
+                    cv2.putText(frame, "NORMAL MODE", (frame_width - 300, 50), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+                    cv2.putText(frame, "ZOOM RESET", (10, frame_height - 140),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                
+                last_gesture_time = current_time
+                return frame
+
         if gesture_text == "two_up":
             index_tip = landmarks[8]  # Index fingertip
             # Convert normalized coordinates to pixel values
@@ -205,7 +293,7 @@ def handle_gesture(frame, gesture_text, landmarks, is_right_hand=True, both_hand
             
             # Send position data in normalized format (0-1 range)
             position_data = {"x": index_tip.x, "y": index_tip.y}
-            send_websocket("pointer", position_data)
+            send_websocket("two_up", position_data)
             
             # Draw tracking indicator on frame - use a different color from tracking mode
             cv2.circle(frame, (x, y), 15, (255, 165, 0), -1)  # Orange circle
@@ -225,8 +313,8 @@ def handle_gesture(frame, gesture_text, landmarks, is_right_hand=True, both_hand
             y = int(index_tip.y * frame_height)
             
             # Send position data in normalized format (0-1 range)
-            position_data = {"x": index_tip.x, "y": index_tip.y}
-            send_websocket("draw", position_data)
+            position_data = {"x": x, "y": y}
+            send_websocket("one", position_data)
             
             # Draw tracking indicator on frame
             cv2.circle(frame, (x, y), 15, (0, 255, 255), -1)  # Yellow circle
@@ -238,136 +326,146 @@ def handle_gesture(frame, gesture_text, landmarks, is_right_hand=True, both_hand
         # Check cooldown and process gesture
         if current_time - last_gesture_time >= GESTURE_COOLDOWN:
             frame_height = frame.shape[0]
-            # Her gesture için ayrı işlem bloğu
-            if gesture_text == "call":
-                # call için özel işlem
-                send_websocket("call")
-            elif gesture_text == "dislike":
-                # dislike için özel işlem
-                angle = calculate_angle(landmarks[4], landmarks[2], landmarks[5])
-                
-                # Adjust finger closed logic based on hand orientation
-                if is_right_hand:
-                    # For right hand: finger tips should be to the left of MCP joints when making thumbs down
-                    index_closed = landmarks[8].x > landmarks[5].x
-                    middle_closed = landmarks[12].x > landmarks[9].x
-                    ring_closed = landmarks[16].x > landmarks[13].x
-                    pinky_closed = landmarks[20].x > landmarks[17].x
-                else:
-                    # For left hand: finger tips should be to the right of MCP joints when making thumbs down
-                    index_closed = landmarks[8].x < landmarks[5].x
-                    middle_closed = landmarks[12].x < landmarks[9].x
-                    ring_closed = landmarks[16].x < landmarks[13].x
-                    pinky_closed = landmarks[20].x < landmarks[17].x
-                
-                if 75 < angle < 120 and index_closed and middle_closed and ring_closed and pinky_closed:
-                    send_websocket("dislike")
-            elif gesture_text == "like":
-                # Angle between thumb tip, wrist, and index tip
-                angle = calculate_angle(landmarks[4], landmarks[2], landmarks[5])
-                if 75 < angle < 120:  # Thumb is roughly perpendicular to index
-                    send_websocket("like")
-            elif gesture_text == "ok":
-                # gesture_threshold = int(landmarks[8].y * frame_height)
-                send_websocket("ok")
-            elif gesture_text == "rock":
-                send_websocket("rock")
-            elif gesture_text == "three":
-                send_websocket("zoom_in")
-            elif gesture_text == "three2":
-                send_websocket("three2")
-            elif gesture_text == "timeout":
-                # *** MODIFIED: Check if both hands are present before triggering timeout ***
-                if both_hands_active:
-                    send_websocket("timeout")
+            
+            # Handle gesture differently in zoom mode
+            if ZOOM_CONFIG["active"]:
+                # In zoom mode, remap certain gestures
+                if gesture_text == "like":
+                    send_websocket("up")
                     if DEBUG:
-                        cv2.putText(frame, "BOTH HANDS DETECTED - TIMEOUT!", 
-                                  (10, frame_height - 150),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-                else:
+                        cv2.putText(frame, "ZOOM UP", (10, frame_height - 140),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2, cv2.LINE_AA)
+                elif gesture_text == "dislike":
+                    send_websocket("down")
                     if DEBUG:
-                        cv2.putText(frame, "NEED BOTH HANDS FOR TIMEOUT!", 
-                                  (10, frame_height - 150),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-            elif gesture_text == "three_gun":
-                thumb_tip = landmarks[4]  # Thumb tip
-                index_tip = landmarks[8]  # Index finger tip
-                
-                # Calculate direction based on thumb and index finger position
-                if thumb_tip.x < index_tip.x:  # Thumb is to the right of index finger
-                    send_websocket("previous_slide")  # Map to LEFT command for WebSocket
-                else:  # Thumb is to the left of index finger
-                    send_websocket("next_slide")  # Map to RIGHT command for WebSocket
-            elif gesture_text == "palm" and int(landmarks[1].y * frame_height) < gesture_threshold:
-                send_websocket("attention")
-            elif gesture_text == "take_picture":
-                # *** MODIFIED: Check if both hands are present before triggering take_picture ***
-                if both_hands_active:
-                    send_websocket("attendance")
+                        cv2.putText(frame, "ZOOM DOWN", (10, frame_height - 140),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2, cv2.LINE_AA)
+                elif gesture_text == "three_gun":
+                    thumb_tip = landmarks[4]  # Thumb tip
+                    index_tip = landmarks[8]  # Index finger tip
+                    
+                    # Calculate direction based on thumb and index finger position
+                    if thumb_tip.x < index_tip.x:  # Thumb is to the right of index finger
+                        send_websocket("right")
+                    else:  # Thumb is to the left of index finger
+                        send_websocket("left")
+                # Remove the palm gesture handler from here since we handle it above
+                # No need for the else clause
+            else:
+                # Normal mode - original gesture handling
+                if gesture_text == "call":
+                    send_websocket("call")
+                elif gesture_text == "dislike":
+                    # dislike için özel işlem
+                    angle = calculate_angle(landmarks[4], landmarks[2], landmarks[5])
+                    
+                    # Adjust finger closed logic based on hand orientation
+                    if is_right_hand:
+                        # For right hand: finger tips should be to the left of MCP joints when making thumbs down
+                        index_closed = landmarks[8].x > landmarks[5].x
+                        middle_closed = landmarks[12].x > landmarks[9].x
+                        ring_closed = landmarks[16].x > landmarks[13].x
+                        pinky_closed = landmarks[20].x > landmarks[17].x
+                    else:
+                        # For left hand: finger tips should be to the right of MCP joints when making thumbs down
+                        index_closed = landmarks[8].x < landmarks[5].x
+                        middle_closed = landmarks[12].x < landmarks[9].x
+                        ring_closed = landmarks[16].x < landmarks[13].x
+                        pinky_closed = landmarks[20].x < landmarks[17].x
+                    
                     if DEBUG:
-                        cv2.putText(frame, "BOTH HANDS DETECTED - TAKING PICTURE!", 
-                                  (10, frame_height - 120),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-                else:
+                        print(f"Hand: {'Right' if is_right_hand else 'Left'}")
+                        print(f"Landmark 20 x: {landmarks[20].x}, Landmark 17 x: {landmarks[17].x}")
+                        print(f"Thumb to index angle: {angle:.2f} degrees")
+                    
+                    if 75 < angle < 130 and index_closed and middle_closed and ring_closed and pinky_closed:
+                        send_websocket("dislike")
+                elif gesture_text == "like":
+                    # Angle between thumb tip, wrist, and index tip
+                    angle = calculate_angle(landmarks[4], landmarks[2], landmarks[5])
                     if DEBUG:
-                        cv2.putText(frame, "NEED BOTH HANDS FOR PICTURE!", 
-                                  (10, frame_height - 120),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-            elif gesture_text == "hand_heart":
-                # *** MODIFIED: Check if both hands are present before triggering heart ***
-                if both_hands_active:
-                    send_websocket("heart")
-                    if DEBUG:
-                        cv2.putText(frame, "BOTH HANDS DETECTED - HEART!", 
-                                  (10, frame_height - 180),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-                else:
-                    if DEBUG:
-                        cv2.putText(frame, "NEED BOTH HANDS FOR HEART!", 
-                                  (10, frame_height - 180),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-            elif gesture_text == "hand_heart2":
-                # *** MODIFIED: Check if both hands are present before triggering heart2 ***
-                if both_hands_active:
-                    send_websocket("heart2")
-                    if DEBUG:
-                        cv2.putText(frame, "BOTH HANDS DETECTED - HEART2!", 
-                                  (10, frame_height - 210),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-                else:
-                    if DEBUG:
-                        cv2.putText(frame, "NEED BOTH HANDS FOR HEART2!", 
-                                  (10, frame_height - 210),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-            elif gesture_text == "middle_finger":
-                send_websocket("mid_finger")
-            elif gesture_text == "four":
-                send_websocket("zoom_out")
-            elif gesture_text == "thumb_index":
-                send_websocket("thumb_index")
-            elif gesture_text == "holy":
-                send_websocket("holy")
-                
+                        print(f"Thumb to index angle: {angle:.2f} degrees")
+                    if 75 < angle < 120:  # Thumb is roughly perpendicular to index
+                        send_websocket("like")
+                # elif gesture_text == "ok":
+                #     # gesture_threshold = int(landmarks[8].y * frame_height)
+                #     send_websocket("ok")
+                elif gesture_text == "rock":
+                    send_websocket("rock")
+                elif gesture_text == "three":
+                    send_websocket("three")
+                elif gesture_text == "three2":
+                    send_websocket("three2")
+                elif gesture_text == "timeout":
+                    if both_hands_active:
+                        send_websocket("timeout")
+                elif gesture_text == "three_gun":
+                    thumb_tip = landmarks[4]  # Thumb tip
+                    index_tip = landmarks[8]  # Index finger tip
+                    
+                    # Calculate direction based on thumb and index finger position
+                    if thumb_tip.x < index_tip.x:  # Thumb is to the right of index finger
+                        send_websocket("inv_three_gun")
+                    else:  # Thumb is to the left of index finger
+                        send_websocket("three_gun")
+                elif gesture_text == "palm" and int(landmarks[1].y * frame_height) < gesture_threshold:
+                    send_websocket("palm")
+                elif gesture_text == "take_picture":
+                    if both_hands_active:
+                        send_websocket("take_picture")
+                elif gesture_text == "hand_heart":
+                    if both_hands_active:
+                        send_websocket("heart")
+                elif gesture_text == "hand_heart2":
+                    if both_hands_active:
+                        send_websocket("hand_heart2")
+                elif gesture_text == "middle_finger":
+                    send_websocket("mid_finger")
+                elif gesture_text == "thumb_index":
+                    send_websocket("thumb_index")
+                elif gesture_text == "holy":
+                    send_websocket("holy")
+                elif gesture_text == "three_3":
+                    send_websocket(gesture_text)
+                    
             last_tracked_gesture = gesture_text
 
             # Update last gesture time
             last_gesture_time = current_time
+
+        # Display zoom mode status on the frame if active
+        if ZOOM_CONFIG["active"] and DEBUG:
+            cv2.putText(frame, "ZOOM MODE", (10, 150),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
     
     return frame
 
-
 # Setup the named pipe before starting camera
+clear_websocket_file()
 setup_pipe()
 
-# Send an initial message to indicate Python process is ready
-send_websocket("init", {"status": "ready"})
+# Initialize Pi Camera 2
+print("Initializing Pi Camera 2...")
+picam2 = Picamera2()
 
-# Kamerayı aç
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("Kamera acilamadi! Kamera numarasi hatali")
-    cleanup_handler(None, None)
-    
+# Configure camera - adjust resolution as needed
+config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
+picam2.configure(config)
+
+# Optional: Set camera controls for better performance
+picam2.set_controls({
+    "ExposureTime": 20000,  # 20ms exposure time
+    "AnalogueGain": 1.0,
+    "FrameRate": 30.0
+})
+
+# Start the camera
+picam2.start()
+print("Pi Camera 2 started successfully")
+
+# Allow camera to warm up
+time.sleep(2)
+
 # Cikti zamanlamasi
 last_output_time = time.time()
 current_gesture = "IDLE"
@@ -388,15 +486,18 @@ except FileNotFoundError:
 print(f"Gesture recognition system started. Sending commands through pipe: {PIPE_PATH}")
 print("Press 'q' to quit")
 
-# Modified main loop section
 try:
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Kameradan görüntü alınamıyor.")
-            break
+        # Capture frame from Pi Camera
+        frame = picam2.capture_array()
         
+        # Convert RGB to BGR for OpenCV compatibility
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        # Flip frame horizontally for mirror effect
         frame = cv2.flip(frame, 1)
+
+        # Convert BGR to RGB for MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
         # El tespit et
@@ -421,7 +522,6 @@ try:
         current_hand_landmarks = None
         is_right_hand = True  # Default assumption
         
-        # Eğer el tespit edildiyse
         if results.multi_hand_landmarks:
             # Process the primary hand (first detected hand for gesture recognition)
             primary_hand = results.multi_hand_landmarks[0]
@@ -465,7 +565,7 @@ try:
             # Tahmin güvenini al
             confidence = prediction[0][gesture_index]
 
-            if confidence > 0.85:
+            if confidence > 0.70:
                 detected_gesture = gesture  # Algılanan hareket
                 
                 # Algılanan hareket değişirse, yeni zamanlayıcı başlat
@@ -484,6 +584,7 @@ try:
                 # El tespit edildi ama yetersiz confidence degere sahip
                 if DEBUG:
                     gesture_text = "Uncertain"
+                    gesture_text = f"Uncertain ({confidence:.2f})"
                 current_gesture = "IDLE"
         else:
             # Hand not detected
@@ -536,6 +637,7 @@ except Exception as e:
     print(f"Error in main loop: {e}")
 finally:
     # Temizle
-    cap.release()
+    picam2.stop()
+    picam2.close()
     cv2.destroyAllWindows()
     cleanup_handler(None, None)
