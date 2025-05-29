@@ -159,17 +159,6 @@ def send_websocket(command, position_data=None):
     # Convert to JSON string and add newline for message separation
     json_str = json.dumps(message) + "\n"
     
-    # In DEBUG mode, write to file instead of pipe
-    if DEBUG:
-        try:
-            with open('websocket.txt', 'a') as f:
-                f.write(json_str)
-            print(f"DEBUG: Wrote to websocket.txt: {command}")
-            return
-        except Exception as e:
-            print(f"DEBUG: Error writing to file: {e}")
-            return
-    
     # Non-DEBUG mode: Use named pipe as before
     try:
         # Open pipe for writing if not already open
@@ -181,7 +170,7 @@ def send_websocket(command, position_data=None):
                 if e.errno == 6:  # No such device or address
                     # No reader connected yet, skip this message
                     if DEBUG:
-                        print(f"No reader connected, skipping: {command}")
+                        print(f"Command: {command}")
                     return
                 else:
                     raise
@@ -211,29 +200,45 @@ def send_websocket(command, position_data=None):
                 pass
             pipe_fd = None
 
-# Update the toggle_zoom_mode function to accept a forced state parameter
-def toggle_zoom_mode(force_state=None):
+# First, update the toggle_zoom_mode function to accept a specific direction parameter
+def toggle_zoom_mode(direction=None):
     """
     Toggle between normal mode and zoom mode
-    If force_state is provided, set to that state instead of toggling
+    direction: "on" to force zoom mode on, "off" to force zoom mode off, None to toggle
     """
     global ZOOM_CONFIG
     
-    if force_state is not None:
-        ZOOM_CONFIG["active"] = force_state
-    else:
-        ZOOM_CONFIG["active"] = not ZOOM_CONFIG["active"]
+    if direction == "on":
         
-    mode_name = "ZOOM" if ZOOM_CONFIG["active"] else "NORMAL"
-    print(f"Mode switched to: {mode_name} MODE")
-    
-    # Only send zoom_in command when activating zoom mode
-    if ZOOM_CONFIG["active"]:
         send_websocket("zoom_in")
+        # Only change if not already in zoom mode
+        if not ZOOM_CONFIG["active"]:
+            ZOOM_CONFIG["active"] = True
+            print("Mode switched to: ZOOM MODE")
+        
+        return True
     
-    return ZOOM_CONFIG["active"]
+    elif direction == "off":
+        # Only change if currently in zoom mode
+        if ZOOM_CONFIG["active"]:
+            ZOOM_CONFIG["active"] = False
+            print("Mode switched to: NORMAL MODE")
+            return False
+        return ZOOM_CONFIG["active"]  # Already in normal mode
+    
+    else:
+        # Toggle behavior (original functionality)
+        ZOOM_CONFIG["active"] = not ZOOM_CONFIG["active"]
+        mode_name = "ZOOM" if ZOOM_CONFIG["active"] else "NORMAL"
+        print(f"Mode switched to: {mode_name} MODE")
+        
+        # Only send zoom_in command when activating zoom mode
+        if ZOOM_CONFIG["active"]:
+            send_websocket("zoom_in")
+        
+        return ZOOM_CONFIG["active"]
 
-# Modify the handle_gesture function to support zoom mode
+# Now modify the gesture handler to use these specific directions
 def handle_gesture(frame, gesture_text, landmarks, is_right_hand=True, both_hands_active=False):
     global last_gesture_time, gesture_threshold, DRAWING_MODE, last_tracked_gesture
     current_time = time.time()
@@ -243,21 +248,36 @@ def handle_gesture(frame, gesture_text, landmarks, is_right_hand=True, both_hand
         frame_height = frame.shape[0]
         frame_width = frame.shape[1]
 
-        # Check if this is the zoom toggle gesture
-        if gesture_text == ZOOM_CONFIG["toggle_gesture"] and current_time - last_gesture_time >= GESTURE_COOLDOWN:
-            # Toggle zoom mode
-            is_zoom_mode = toggle_zoom_mode()
+        # Check for "ok" gesture to switch TO zoom mode
+        if gesture_text == "ok" and current_time - last_gesture_time >= GESTURE_COOLDOWN:
+            # Switch to zoom mode
+            is_zoom_mode = toggle_zoom_mode(direction="on")
             
             # Display zoom mode indicator on frame
             if DEBUG:
-                mode_text = "ZOOM MODE ACTIVE" if is_zoom_mode else "NORMAL MODE"
-                mode_color = (0, 0, 255) if is_zoom_mode else (0, 255, 0)
+                mode_text = "ZOOM MODE ACTIVE"
+                mode_color = (0, 0, 255)
                 cv2.putText(frame, mode_text, (frame_width - 300, 50), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, mode_color, 2, cv2.LINE_AA)
             
             last_gesture_time = current_time
-            last_tracked_gesture = gesture_text
             return frame
+
+        # Check for "palm" gesture ABOVE threshold to switch BACK to normal mode
+        if gesture_text == "palm" and int(landmarks[0].y * frame_height) < gesture_threshold and ZOOM_CONFIG["active"]:
+            if current_time - last_gesture_time >= GESTURE_COOLDOWN:
+                # Switch back to normal mode
+                toggle_zoom_mode(direction="off")
+                send_websocket("zoom_reset")
+                
+                if DEBUG:
+                    cv2.putText(frame, "NORMAL MODE", (frame_width - 300, 50), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+                    cv2.putText(frame, "ZOOM RESET", (10, frame_height - 140),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                
+                last_gesture_time = current_time
+                return frame
 
         if gesture_text == "two_up":
             index_tip = landmarks[8]  # Index fingertip
@@ -323,17 +343,8 @@ def handle_gesture(frame, gesture_text, landmarks, is_right_hand=True, both_hand
                         send_websocket("right")
                     else:  # Thumb is to the left of index finger
                         send_websocket("left")
-                elif gesture_text == "palm" and int(landmarks[1].y * frame_height) < gesture_threshold:
-                    send_websocket("zoom_reset")
-                    # Force mode to normal when zoom_reset is sent
-                    toggle_zoom_mode(force_state=False)
-                    if DEBUG:
-                        cv2.putText(frame, "ZOOM RESET", (10, frame_height - 140),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-                else:
-                    # For all other gestures, process them normally
-                    # This is intentionally empty - we only want to handle the remapped gestures
-                    pass
+                # Remove the palm gesture handler from here since we handle it above
+                # No need for the else clause
             else:
                 # Normal mode - original gesture handling
                 if gesture_text == "call":
@@ -370,9 +381,9 @@ def handle_gesture(frame, gesture_text, landmarks, is_right_hand=True, both_hand
                         print(f"Thumb to index angle: {angle:.2f} degrees")
                     if 75 < angle < 120:  # Thumb is roughly perpendicular to index
                         send_websocket("like")
-                elif gesture_text == "ok":
-                    # gesture_threshold = int(landmarks[8].y * frame_height)
-                    send_websocket("ok")
+                # elif gesture_text == "ok":
+                #     # gesture_threshold = int(landmarks[8].y * frame_height)
+                #     send_websocket("ok")
                 elif gesture_text == "rock":
                     send_websocket("rock")
                 elif gesture_text == "three":
