@@ -5,13 +5,20 @@
 // Standard Library includes
 #include <iostream>
 #include <map>
-#include <set>
 #include <string>
-#include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <chrono>
+#include <functional>
 #include <cstdlib>
 #include <stdexcept>
+
+// Networking includes for UDP broadcasting
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 // JSON library for message parsing/serialization
 #include <nlohmann/json.hpp>
@@ -26,11 +33,10 @@ using websocketpp::connection_hdl;
 typedef websocketpp::server<websocketpp::config::asio> server;
 typedef server::message_ptr message_ptr;
 
-// Enumeration of client roles for routing logic
+// Simplified enumeration of client roles - we only care about hardware and desktop
 enum class ClientType {
     HARDWARE,
     DESKTOP,
-    MOBILE,
     UNKNOWN // Before the client registers
 };
 
@@ -39,6 +45,81 @@ struct ClientInfo {
     ClientType type = ClientType::UNKNOWN;  // Role of this client
     std::string id = "";                    // Client-provided unique ID
 };
+
+// Function to discover desktop client via UDP broadcast
+// Returns the IP address of the desktop if found, empty string otherwise
+std::string discoverDesktopIP(int port = 9999, const std::string& broadcastMessage = "raspberry_discovery") {
+    std::cout << "[UDP] Starting desktop discovery process..." << std::endl;
+    
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        return "";
+    }
+
+    // Enable broadcasting on the socket
+    int broadcastEnable = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable)) < 0) {
+        perror("setsockopt");
+        close(sock);
+        return "";
+    }
+
+    // Set up broadcast address
+    sockaddr_in broadcastAddr{};
+    broadcastAddr.sin_family = AF_INET;
+    broadcastAddr.sin_port = htons(port);
+    broadcastAddr.sin_addr.s_addr = inet_addr("255.255.255.255");
+
+    // Set up structures for receiving response
+    sockaddr_in fromAddr{};
+    socklen_t fromLen = sizeof(fromAddr);
+    char buffer[128];
+
+    // Try to discover desktop with multiple attempts
+    const int MAX_ATTEMPTS = 5;
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        // Send discovery message
+        ssize_t sent = sendto(sock, broadcastMessage.c_str(), broadcastMessage.length(), 0,
+                             (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
+        if (sent < 0) {
+            perror("sendto");
+        } else {
+            std::cout << "[UDP] Broadcast sent (attempt " << attempt << "/" << MAX_ATTEMPTS 
+                      << "), waiting for response..." << std::endl;
+        }
+
+        // Set 2-second receive timeout
+        struct timeval tv = {2, 0};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        // Try receiving response
+        ssize_t recvLen = recvfrom(sock, buffer, sizeof(buffer) - 1, 0,
+                                  (sockaddr*)&fromAddr, &fromLen);
+        if (recvLen > 0) {
+            buffer[recvLen] = '\0';
+            std::string desktopIp(buffer);
+
+            // Check if received data looks like a valid IP (basic check)
+            if (!desktopIp.empty() && desktopIp.find('.') != std::string::npos) {
+                std::cout << "[UDP] Desktop IP address found: " << desktopIp << std::endl;
+                close(sock);
+                return desktopIp;
+            } else {
+                std::cerr << "[UDP] Invalid IP response received: '" << desktopIp << "'" << std::endl;
+            }
+        } else {
+            std::cout << "[UDP] No response received, trying again..." << std::endl;
+        }
+
+        // Wait before next attempt
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    std::cout << "[UDP] Desktop discovery failed after " << MAX_ATTEMPTS << " attempts" << std::endl;
+    close(sock);
+    return "";
+}
 
 class AirClassServer {
 public:
@@ -64,6 +145,14 @@ public:
             m_server.listen(port);        // Bind socket to port
             m_server.start_accept();      // Begin accepting connections
             std::cout << "WebSocket Server started on port " << port << std::endl;
+            
+            // Try to discover desktop IP before entering event loop
+            std::string desktopIp = discoverDesktopIP();
+            if (!desktopIp.empty()) {
+                std::cout << "Desktop client found at: " << desktopIp << std::endl;
+                // You could store this IP for later use if needed
+            }
+            
             m_server.run();               // Enter the event loop (blocks)
         } catch (const websocketpp::exception& e) {
             std::cerr << "WebSocket Exception: " << e.what() << std::endl;
@@ -142,25 +231,53 @@ private:
             return;
         }
 
-        // 2) Already registered: log incoming message
-        std::cout << "Received message from " << clientTypeToString(sender_type)
-                  << " (ID: " << sender_info->id << "): " << payload << std::endl;
-
-        // Determine where to forward based on sender role
-        ClientType target_type = ClientType::UNKNOWN;
+        // 2) For hardware clients, print detailed JSON data
         if (sender_type == ClientType::HARDWARE) {
-            target_type = ClientType::DESKTOP;
-        } else if (sender_type == ClientType::DESKTOP) {
-            target_type = ClientType::MOBILE;
-        } else if (sender_type == ClientType::MOBILE) {
-            target_type = ClientType::DESKTOP;
-        } else {
-            std::cerr << "Warning: Unexpected sender type post-registration." << std::endl;
-            return;
+            std::cout << "\n╔══════════════════════════════════════════════╗" << std::endl;
+            std::cout << "║ HARDWARE MESSAGE RECEIVED                     ║" << std::endl;
+            std::cout << "╠══════════════════════════════════════════════╣" << std::endl;
+            std::cout << "║ Client ID: " << sender_info->id << std::endl;
+            
+            // Try to parse and pretty-print the JSON
+            try {
+                json data = json::parse(payload);
+                
+                // Extract and display command if available
+                if (data.contains("command")) {
+                    std::cout << "║ Command: " << data["command"] << std::endl;
+                }
+                
+                // Check for position data
+                if (data.contains("position")) {
+                    std::cout << "║ Position data: ";
+                    auto position = data["position"];
+                    // If position is an object with coordinates
+                    if (position.is_object()) {
+                        if (position.contains("x")) std::cout << "x=" << position["x"] << " ";
+                        if (position.contains("y")) std::cout << "y=" << position["y"] << " ";
+                        if (position.contains("z")) std::cout << "z=" << position["z"] << " ";
+                    }
+                    std::cout << std::endl;
+                }
+                
+                // Print the full JSON payload for reference
+                std::cout << "║ Raw JSON: " << payload << std::endl;
+            }
+            catch (const json::parse_error& e) {
+                std::cout << "║ [Error parsing JSON] Raw payload: " << payload << std::endl;
+                std::cout << "║ Parse error: " << e.what() << std::endl;
+            }
+            
+            std::cout << "╚══════════════════════════════════════════════╝\n" << std::endl;
+            
+            // Forward from hardware to all desktop clients
+            forward_message_to_desktops(payload, msg->get_opcode());
+        } 
+        else if (sender_type == ClientType::DESKTOP) {
+            // For desktop clients, just log receipt
+            std::cout << "Message from desktop client (ID: " << sender_info->id 
+                      << ") received but not forwarded." << std::endl;
         }
-
-        // 3) Forward the payload to all clients of the target type
-        forward_message_to_type(payload, msg->get_opcode(), target_type);
     }
 
     // Parses and validates client registration messages
@@ -183,13 +300,12 @@ private:
                 return;
             }
 
-            // Map string to enum
+            // Map string to enum - simplified to only care about hardware and desktop
             ClientType new_type = ClientType::UNKNOWN;
             if (type_str == "hardware") new_type = ClientType::HARDWARE;
             else if (type_str == "desktop") new_type = ClientType::DESKTOP;
-            else if (type_str == "mobile") new_type = ClientType::MOBILE;
             else {
-                send_error(hdl, "Invalid client type: " + type_str);
+                send_error(hdl, "Invalid client type: " + type_str + ". Must be 'hardware' or 'desktop'.");
                 return;
             }
 
@@ -215,27 +331,43 @@ private:
         }
     }
 
-    // Broadcasts a message payload to all clients of a given type
-    void forward_message_to_type(const std::string& payload,
-                                 websocketpp::frame::opcode::value opcode,
-                                 ClientType target_type) {
+    // Broadcasts a message payload to all desktop clients
+    void forward_message_to_desktops(const std::string& payload,
+                                    websocketpp::frame::opcode::value opcode) {
         std::lock_guard<std::mutex> guard(m_connection_lock);
         int sent_count = 0;
 
+        try {
+            // Try to parse the payload as JSON for better logging
+            json data = json::parse(payload);
+            std::cout << "Forwarding JSON message: " << std::endl;
+            std::cout << "  Command: " << (data.contains("command") ? data["command"].dump() : "N/A") << std::endl;
+            if (data.contains("position")) {
+                std::cout << "  Position: " << data["position"].dump() << std::endl;
+            }
+        } catch (const json::parse_error& e) {
+            // Not JSON or invalid JSON
+            std::cout << "Forwarding non-JSON message: " << payload << std::endl;
+        }
+
         for (auto const& [hdl, info] : m_connections) {
-            if (info->type == target_type) {
+            if (info->type == ClientType::DESKTOP) {
                 try {
                     if (!hdl.expired()) {
                         m_server.send(hdl, payload, opcode);
                         sent_count++;
                     }
                 } catch (const websocketpp::exception& e) {
-                    std::cerr << "Send error to ID " << info->id << ": " << e.what() << std::endl;
+                    std::cerr << "Send error to desktop ID " << info->id << ": " << e.what() << std::endl;
                 }
             }
         }
-        std::cout << "Forwarded message to " << sent_count
-                  << " client(s) of type " << clientTypeToString(target_type) << std::endl;
+        
+        if (sent_count > 0) {
+            std::cout << "Successfully forwarded message to " << sent_count << " desktop client(s)" << std::endl;
+        } else {
+            std::cout << "No desktop clients connected to forward message to" << std::endl;
+        }
     }
 
     // Sends a structured error JSON to a single client
@@ -258,7 +390,6 @@ private:
         switch (type) {
             case ClientType::HARDWARE: return "Hardware";
             case ClientType::DESKTOP:  return "Desktop";
-            case ClientType::MOBILE:   return "Mobile";
             case ClientType::UNKNOWN:  return "Unknown";
         }
         return "InvalidType";
@@ -272,7 +403,7 @@ private:
 
 int main(int argc, char* argv[]) {
     uint16_t port = 8080;  // Default listening port
-
+    
     // Attempt to read Render.com-provided PORT env var first
     if (const char* env_port = std::getenv("PORT")) {
         try {
@@ -290,7 +421,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    std::cout << "--- AirClass Server ---" << std::endl;
+    std::cout << "Starting WebSocket server on port " << port << std::endl;
+    
     AirClassServer server_instance;
     server_instance.run(port);  // Start the server event loop
+    
     return 0;
 }
